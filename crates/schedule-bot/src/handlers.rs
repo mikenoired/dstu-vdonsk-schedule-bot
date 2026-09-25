@@ -506,8 +506,8 @@ async fn handle_callback(bot: Bot, query: CallbackQuery, state: AppState) -> Han
             let id = Uuid::parse_str(data.trim_start_matches("upload:cancel:"))?;
             let (cancelled, source_key) = state.store.cancel_upload(id, user_id).await?;
             if cancelled {
-                if let Some(key) = source_key {
-                    if let Err(error) = state.archive.delete(&key).await {
+                if let (Some(key), Some(archive)) = (source_key, state.archive.as_ref()) {
+                    if let Err(error) = archive.delete(&key).await {
                         tracing::warn!(%error, %key, "не удалось удалить отменённую исходную таблицу из S3");
                     }
                 }
@@ -759,7 +759,17 @@ async fn handle_document(
         .await
     {
         Ok(preview) => {
-            let key = match state.archive.save(preview.id, &extension, &bytes).await {
+            let Some(archive) = state.archive.as_ref() else {
+                state.store.cancel_upload(preview.id, user_id).await?;
+                send_text(
+                    bot,
+                    message.chat.id,
+                    "Архив Excel ещё не настроен. Бот продолжает работать, но публикация расписания временно недоступна.",
+                )
+                .await?;
+                return Ok(());
+            };
+            let key = match archive.save(preview.id, &extension, &bytes).await {
                 Ok(key) => key,
                 Err(error) => {
                     state.store.cancel_upload(preview.id, user_id).await?;
@@ -778,7 +788,7 @@ async fn handle_document(
                 .await
             {
                 state.store.cancel_upload(preview.id, user_id).await?;
-                if let Err(delete_error) = state.archive.delete(&key).await {
+                if let Err(delete_error) = archive.delete(&key).await {
                     tracing::warn!(%delete_error, "не удалось удалить неиспользуемый Excel из S3");
                 }
                 send_text(

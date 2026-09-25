@@ -55,7 +55,17 @@ async fn main() -> Result<()> {
 
     let store = connect_with_retry(&database_url).await?;
     let rate_limiter = connect_redis_with_retry(&redis_url).await?;
-    let archive = SourceArchive::from_env()?;
+    let archive = match SourceArchive::from_env() {
+        Ok(Some(archive)) => Some(archive),
+        Ok(None) => {
+            warn!("S3 не настроен; бот запустится, но публикация Excel будет недоступна");
+            None
+        }
+        Err(error) => {
+            warn!(%error, "ошибка конфигурации S3; бот запустится без архивации Excel");
+            None
+        }
+    };
     let bot = Bot::new(bot_token);
     let me = bot
         .get_me()

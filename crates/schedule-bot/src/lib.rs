@@ -19,7 +19,7 @@ pub struct AppState {
     pub timezone: Tz,
     pub bot_username: String,
     pub rate_limiter: RateLimiter,
-    pub archive: SourceArchive,
+    pub archive: Option<SourceArchive>,
 }
 
 impl AppState {
