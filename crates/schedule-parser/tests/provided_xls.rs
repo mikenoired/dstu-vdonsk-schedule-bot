@@ -89,28 +89,28 @@ fn parses_the_four_attached_consecutive_weekly_workbooks() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tables");
     let workbooks = [
         (
-            "2_ОФО_ОЗФО_Расписание 2 учебной недели осеннего семестра (07.09.2026-13.09.2026) (1).xls",
+            "2_",
             NaiveDate::from_ymd_opt(2026, 9, 7).unwrap(),
             NaiveDate::from_ymd_opt(2026, 9, 13).unwrap(),
             178,
             25,
         ),
         (
-            "3_ОФО_ОЗФО_Расписание 3 учебной недели осеннего семестра (14.09.2026-20.09.2026).xls",
+            "3_",
             NaiveDate::from_ymd_opt(2026, 9, 14).unwrap(),
             NaiveDate::from_ymd_opt(2026, 9, 20).unwrap(),
             161,
             22,
         ),
         (
-            "4_ОФО_ОЗФО_Расписание 4 учебной недели осеннего семестра (21.09.2026-27.09.2026).xls",
+            "4_",
             NaiveDate::from_ymd_opt(2026, 9, 21).unwrap(),
             NaiveDate::from_ymd_opt(2026, 9, 27).unwrap(),
             179,
             25,
         ),
         (
-            "5_ОФО_ОЗФО_Расписание 5 учебной недели осеннего семестра (28.09.2026-04.10.2026).xls",
+            "5_",
             NaiveDate::from_ymd_opt(2026, 9, 28).unwrap(),
             NaiveDate::from_ymd_opt(2026, 10, 4).unwrap(),
             186,
@@ -118,8 +118,18 @@ fn parses_the_four_attached_consecutive_weekly_workbooks() {
         ),
     ];
 
-    for (file, start, end, expected_lessons, expected_groups) in workbooks {
-        let lessons = parse_file(root.join(file)).unwrap_or_else(|error| panic!("{file}: {error}"));
+    for (prefix, start, end, expected_lessons, expected_groups) in workbooks {
+        let path = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(prefix))
+            })
+            .unwrap_or_else(|| panic!("не найдена таблица недели с префиксом {prefix}"));
+        let file = path.file_name().unwrap().to_string_lossy();
+        let lessons = parse_file(&path).unwrap_or_else(|error| panic!("{file}: {error}"));
         assert!(!lessons.is_empty(), "{file}: расписание пустое");
         assert!(
             lessons
