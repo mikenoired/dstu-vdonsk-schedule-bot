@@ -380,14 +380,20 @@ impl Store {
             bail!("загрузка доступна только администраторам");
         }
         let (week_start, week_end) = validate_schedule(&lessons)?;
-        let duplicate: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM schedule_versions WHERE file_sha256 = $1)",
+        let (was_published, is_current_file): (bool, bool) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM schedule_versions WHERE file_sha256 = $1), \
+             EXISTS (SELECT 1 FROM schedule_versions v JOIN schedule_weeks w \
+                     ON w.current_version = v.id \
+                     WHERE v.file_sha256 = $1 AND v.week_start = $2)",
         )
         .bind(file_sha256)
+        .bind(week_start)
         .fetch_one(&self.pool)
         .await?;
-        if duplicate {
-            bail!("этот Excel-файл уже публиковали");
+        if was_published && !is_current_file {
+            bail!(
+                "этот Excel-файл уже публиковали, но он больше не является текущей версией недели"
+            );
         }
 
         let existing: Option<Uuid> = sqlx::query_scalar(
@@ -409,6 +415,9 @@ impl Store {
         };
         let diff = compare_schedules(&old_lessons, &lessons);
         if kind == UpdateKind::Correction && diff.changed_groups.is_empty() {
+            if is_current_file {
+                bail!("эта версия Excel уже опубликована и не содержит новых изменений");
+            }
             bail!("в файле нет изменений относительно опубликованной версии недели");
         }
         let parsed_lessons = serde_json::to_value(&lessons)?;

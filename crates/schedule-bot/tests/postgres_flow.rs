@@ -44,10 +44,32 @@ async fn registration_admin_group_publish_correction_and_outbox(
 
     store.set_pending_group(202, "ИС11В").await?;
     assert_eq!(store.confirm_group(202).await?.as_deref(), Some("ИС11В"));
+
+    let mut second_pair = shared_lesson.clone();
+    second_pair.lesson_number = 2;
+    second_pair.start_time = "10:05".into();
+    second_pair.end_time = "11:40".into();
+    let reparsed_lessons = vec![shared_lesson.clone(), second_pair];
+    let reparsed = store
+        .preview_upload(101, "week.xls", &"a".repeat(64), reparsed_lessons.clone())
+        .await?;
+    assert_eq!(reparsed.kind, UpdateKind::Correction);
+    assert_eq!(reparsed.diff.added, 1);
+    store.confirm_upload(reparsed.id, 101).await?;
+    let reparse_notice = store.ready_notifications(10).await?;
+    assert_eq!(reparse_notice.len(), 1);
+    store.mark_notification_sent(reparse_notice[0].id).await?;
+    assert!(
+        store
+            .preview_upload(101, "week.xls", &"a".repeat(64), reparsed_lessons)
+            .await
+            .is_err()
+    );
+
     let week = store
         .week_lessons("ИС11В", NaiveDate::from_ymd_opt(2026, 9, 29).unwrap())
         .await?;
-    assert_eq!(week.len(), 1);
+    assert_eq!(week.len(), 2);
     assert_eq!(week[0].subject, "Алгебра");
     let corrected = lesson("Геометрия", &["ИС11В", "КТО11В"]);
     let correction = store
