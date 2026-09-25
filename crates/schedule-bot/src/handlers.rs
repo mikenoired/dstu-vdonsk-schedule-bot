@@ -133,17 +133,14 @@ async fn handle_start(
     let chat_id = message.chat.id;
     let parameter = text.split_whitespace().nth(1).unwrap_or("");
     if let Some(token) = parameter.strip_prefix("adm_") {
-        if state.store.redeem_invite(user_id, token).await? {
-            send_text(bot, chat_id, "✅ Права администратора выданы. Отправь Excel-файл расписания или используй /admin_link для приглашения администратора.").await?;
-            return Ok(());
-        }
+        state.store.redeem_invite(user_id, token).await?;
     } else if let Some(token) = parameter.strip_prefix("bootstrap_") {
         if let Some(secret) = state.bootstrap_token.as_deref() {
             if bool::from(token.as_bytes().ct_eq(secret.as_bytes()))
                 && state.store.claim_bootstrap_admin(user_id).await?
             {
-                send_text(bot, chat_id, "✅ Создан первый администратор. Отправь Excel-файл или создай одноразовую ссылку командой /admin_link.").await?;
-                return Ok(());
+                // Continue into the regular start flow so the new admin can also
+                // choose a group and use the schedule menu.
             }
         }
     }
@@ -154,12 +151,25 @@ async fn handle_start(
         .await?
         .ok_or_else(|| anyhow!("пользователь не найден"))?;
     if user.role == "admin" {
-        send_text(
-            bot,
-            chat_id,
-            "Ты вошёл как администратор. Пришли Excel с расписанием или используй /admin_link.",
-        )
-        .await?;
+        if let Some(group) = user.group_code {
+            send_menu(
+                bot,
+                chat_id,
+                &format!("Ты вошёл как администратор. Группа: {group}.\nВыбери расписание в меню, отправь Excel для публикации или используй /admin_link."),
+            )
+            .await?;
+        } else {
+            state
+                .store
+                .set_flow_state(user_id, "await_group", None)
+                .await?;
+            send_text(
+                bot,
+                chat_id,
+                "Права администратора активны. Чтобы открыть расписание, напиши свою группу. Ты также можешь отправить Excel или создать ссылку командой /admin_link.",
+            )
+            .await?;
+        }
     } else if let Some(group) = user.group_code {
         send_menu(
             bot,
