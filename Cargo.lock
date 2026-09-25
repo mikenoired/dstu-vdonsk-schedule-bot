@@ -2669,6 +2669,7 @@ dependencies = [
 name = "schedule-bot"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "axum",
  "chrono",
@@ -2676,6 +2677,8 @@ dependencies = [
  "dotenvy",
  "dptree",
  "hex",
+ "image",
+ "imageproc",
  "object_store",
  "redis",
  "schedule-parser",

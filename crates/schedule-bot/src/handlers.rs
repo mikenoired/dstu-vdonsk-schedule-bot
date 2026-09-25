@@ -1,5 +1,6 @@
 use crate::AppState;
 use crate::format::format_schedule;
+use crate::stats::{self, Period};
 use anyhow::{Context, Result, anyhow};
 use chrono::NaiveDate;
 use schedule_parser::Lesson;
@@ -13,7 +14,8 @@ use teloxide::{
     requests::Requester,
     types::{
         CallbackQuery, ChatId, ChatKind, ChatMemberKind, InlineKeyboardButton,
-        InlineKeyboardMarkup, KeyboardButton, KeyboardMarkup, Message, PublicChatKind, Update,
+        InlineKeyboardMarkup, InputFile, InputMedia, InputMediaPhoto, KeyboardButton,
+        KeyboardMarkup, Message, PublicChatKind, Update,
     },
 };
 use tokio::io::AsyncWriteExt;
@@ -37,7 +39,7 @@ async fn handle_message(bot: Bot, message: Message, state: AppState) -> HandlerR
     match &message.chat.kind {
         ChatKind::Private(_) => {
             if !state.rate_limiter.allow(user_id, chat_id).await? {
-                crate::metrics::RATE_LIMITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                record_metric(&state, stats::Metric::RateLimited, 1).await;
                 if state.rate_limiter.should_warn(user_id).await? {
                     send_text(
                         &bot,
@@ -48,6 +50,7 @@ async fn handle_message(bot: Bot, message: Message, state: AppState) -> HandlerR
                 }
                 return Ok(());
             }
+            record_metric(&state, stats::Metric::Commands, 1).await;
             handle_private_message(bot, message, state, user_id, username.as_deref()).await
         }
         ChatKind::Public(chat)
@@ -76,6 +79,23 @@ async fn handle_private_message(
         .await?;
 
     if let Some(text) = message.text() {
+        if text
+            .split_whitespace()
+            .next()
+            .is_some_and(|command| command == "/stats" || command.starts_with("/stats@"))
+        {
+            if !state.store.is_admin(user_id).await? {
+                send_text(
+                    &bot,
+                    message.chat.id,
+                    "Эта команда доступна только администратору.",
+                )
+                .await?;
+                return Ok(());
+            }
+            send_stats_dashboard(&bot, message.chat.id, &state, Period::Day).await?;
+            return Ok(());
+        }
         if text.starts_with("/start") {
             handle_start(&bot, &message, &state, user_id, text).await?;
             return Ok(());
@@ -196,9 +216,10 @@ async fn handle_group_message(
     };
     let chat_id = message.chat.id;
     if !state.rate_limiter.allow(user_id, chat_id.0).await? {
-        crate::metrics::RATE_LIMITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        record_metric(&state, stats::Metric::RateLimited, 1).await;
         return Ok(());
     }
+    record_metric(&state, stats::Metric::Commands, 1).await;
 
     match command.as_str() {
         "disable" => {
@@ -421,7 +442,7 @@ async fn handle_callback(bot: Bot, query: CallbackQuery, state: AppState) -> Han
     let user_id = query.from.id.0 as i64;
     let chat_id = ChatId(user_id);
     if !state.rate_limiter.allow(user_id, chat_id.0).await? {
-        crate::metrics::RATE_LIMITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        record_metric(&state, stats::Metric::RateLimited, 1).await;
         bot.answer_callback_query(query.id.clone()).await?;
         if state.rate_limiter.should_warn(user_id).await? {
             send_text(
@@ -434,7 +455,38 @@ async fn handle_callback(bot: Bot, query: CallbackQuery, state: AppState) -> Han
         return Ok(());
     }
     let data = query.data.as_deref().unwrap_or("").to_owned();
+    if let Some(period_code) = data.strip_prefix("stats:") {
+        let Some(period) = Period::from_callback(period_code) else {
+            bot.answer_callback_query(query.id.clone()).await?;
+            return Ok(());
+        };
+        let message = query
+            .message
+            .as_ref()
+            .and_then(|message| message.regular_message());
+        let private_message_id = message
+            .filter(|message| message.chat.id.0 == user_id)
+            .map(|message| (message.chat.id, message.id));
+        let is_admin = state.store.is_admin(user_id).await?;
+        if !stats_callback_allowed(
+            is_admin,
+            user_id,
+            private_message_id.map(|(chat_id, _)| chat_id.0),
+        ) {
+            bot.answer_callback_query(query.id.clone())
+                .text("Дашборд доступен администратору в личном чате.")
+                .show_alert(true)
+                .await?;
+            return Ok(());
+        }
+        bot.answer_callback_query(query.id.clone()).await?;
+        record_metric(&state, stats::Metric::Commands, 1).await;
+        let (chat_id, message_id) = private_message_id.expect("checked above");
+        edit_stats_dashboard(&bot, chat_id, message_id, &state, period).await?;
+        return Ok(());
+    }
     bot.answer_callback_query(query.id.clone()).await?;
+    record_metric(&state, stats::Metric::Commands, 1).await;
     state
         .store
         .register_user(user_id, user_id, query.from.username.as_deref())
@@ -536,6 +588,104 @@ async fn handle_callback(bot: Bot, query: CallbackQuery, state: AppState) -> Han
         }
     }
     Ok(())
+}
+
+async fn record_metric(state: &AppState, metric: stats::Metric, amount: u64) {
+    match metric {
+        stats::Metric::RateLimited => {
+            crate::metrics::RATE_LIMITED.fetch_add(amount, std::sync::atomic::Ordering::Relaxed)
+        }
+        stats::Metric::OutboxSent => {
+            crate::metrics::OUTBOX_SENT.fetch_add(amount, std::sync::atomic::Ordering::Relaxed)
+        }
+        stats::Metric::OutboxFailed => {
+            crate::metrics::OUTBOX_FAILED.fetch_add(amount, std::sync::atomic::Ordering::Relaxed)
+        }
+        stats::Metric::DailyEnqueued => {
+            crate::metrics::DAILY_ENQUEUED.fetch_add(amount, std::sync::atomic::Ordering::Relaxed)
+        }
+        stats::Metric::Commands => 0,
+    };
+    if let Err(error) = state.stats.record(metric, amount).await {
+        tracing::warn!(%error, metric = metric.as_str(), "не удалось записать метрику в Redis");
+    }
+}
+
+async fn send_stats_dashboard(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &AppState,
+    period: Period,
+) -> Result<()> {
+    let data = dashboard_data(state, period).await?;
+    let jpeg = stats::render_jpeg(&data)?;
+    bot.send_photo(chat_id, InputFile::memory(jpeg))
+        .caption(format!(
+            "📊 Статистика за {}\nНажми на период, чтобы обновить график.",
+            period.label()
+        ))
+        .reply_markup(stats_keyboard(period))
+        .await?;
+    Ok(())
+}
+
+async fn edit_stats_dashboard(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: teloxide::types::MessageId,
+    state: &AppState,
+    period: Period,
+) -> Result<()> {
+    let data = dashboard_data(state, period).await?;
+    let jpeg = stats::render_jpeg(&data)?;
+    let media = InputMedia::Photo(
+        InputMediaPhoto::new(InputFile::memory(jpeg)).caption(format!(
+            "📊 Статистика за {}\nНажми на период, чтобы обновить график.",
+            period.label()
+        )),
+    );
+    bot.edit_message_media(chat_id, message_id, media)
+        .reply_markup(stats_keyboard(period))
+        .await?;
+    Ok(())
+}
+
+async fn dashboard_data(state: &AppState, period: Period) -> Result<stats::DashboardData> {
+    let queued = state.store.queued_notifications().await.unwrap_or(-1);
+    let last_success = match state.stats.scheduler_last_success().await {
+        Ok(Some(timestamp)) => timestamp,
+        Ok(None) => crate::metrics::read(&crate::metrics::SCHEDULER_LAST_SUCCESS),
+        Err(error) => {
+            tracing::warn!(%error, "не удалось прочитать сохранённое время планировщика");
+            crate::metrics::read(&crate::metrics::SCHEDULER_LAST_SUCCESS)
+        }
+    };
+    Ok(state.stats.dashboard(period, queued, last_success).await?)
+}
+
+fn stats_keyboard(selected: Period) -> InlineKeyboardMarkup {
+    let button = |period: Period, label: &str| {
+        let label = if period == selected {
+            format!("✅ {label}")
+        } else {
+            label.to_owned()
+        };
+        InlineKeyboardButton::callback(label, format!("stats:{}", period.callback()))
+    };
+    InlineKeyboardMarkup::new(vec![
+        vec![
+            button(Period::ThirtyMinutes, "30 мин"),
+            button(Period::Hour, "1 час"),
+        ],
+        vec![
+            button(Period::Day, "24 часа"),
+            button(Period::Week, "7 дней"),
+        ],
+    ])
+}
+
+fn stats_callback_allowed(is_admin: bool, user_id: i64, callback_chat_id: Option<i64>) -> bool {
+    is_admin && callback_chat_id == Some(user_id)
 }
 
 async fn handle_search(
@@ -988,7 +1138,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_group_command;
+    use super::{parse_group_command, stats_callback_allowed};
 
     #[test]
     fn parses_group_command_and_arguments() {
@@ -1009,5 +1159,13 @@ mod tests {
             parse_group_command("/week", "schedulebot"),
             Some(("week".to_owned(), vec![]))
         );
+    }
+
+    #[test]
+    fn dashboard_callbacks_are_limited_to_admin_private_chat() {
+        assert!(stats_callback_allowed(true, 42, Some(42)));
+        assert!(!stats_callback_allowed(false, 42, Some(42)));
+        assert!(!stats_callback_allowed(true, 42, Some(-10042)));
+        assert!(!stats_callback_allowed(true, 42, None));
     }
 }

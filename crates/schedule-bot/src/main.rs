@@ -3,7 +3,7 @@ use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, rou
 use chrono::{NaiveDate, NaiveTime, Utc};
 use schedule_bot::{
     AppState, archive::SourceArchive, format::DailyKind, handlers, metrics,
-    rate_limit::RateLimiter, store::Store,
+    rate_limit::RateLimiter, stats::StatsStore, store::Store,
 };
 use std::{env, time::Duration};
 use teloxide::{
@@ -55,6 +55,7 @@ async fn main() -> Result<()> {
 
     let store = connect_with_retry(&database_url).await?;
     let rate_limiter = connect_redis_with_retry(&redis_url).await?;
+    let stats = StatsStore::connect(&redis_url).await?;
     let archive = match SourceArchive::from_env() {
         Ok(Some(archive)) => Some(archive),
         Ok(None) => {
@@ -85,6 +86,10 @@ async fn main() -> Result<()> {
     .scope(BotCommandScope::AllGroupChats)
     .await
     .context("не удалось зарегистрировать команды для групп")?;
+    bot.set_my_commands([BotCommand::new("stats", "статистика бота (администратор)")])
+        .scope(BotCommandScope::AllPrivateChats)
+        .await
+        .context("не удалось зарегистрировать команду статистики")?;
 
     let state = AppState {
         store,
@@ -92,10 +97,15 @@ async fn main() -> Result<()> {
         timezone,
         bot_username,
         rate_limiter,
+        stats,
         archive,
     };
     spawn_http_endpoints(state.clone())?;
-    tokio::spawn(outbox_worker(bot.clone(), state.store.clone()));
+    tokio::spawn(outbox_worker(
+        bot.clone(),
+        state.store.clone(),
+        state.stats.clone(),
+    ));
     tokio::spawn(daily_schedule_worker(state.clone()));
 
     Dispatcher::builder(bot, handlers::schema())
@@ -140,10 +150,17 @@ async fn daily_schedule_worker(state: AppState) {
         {
             Ok(queued) if queued > 0 => {
                 metrics::DAILY_ENQUEUED.fetch_add(queued, std::sync::atomic::Ordering::Relaxed);
+                record_stat(
+                    &state.stats,
+                    schedule_bot::stats::Metric::DailyEnqueued,
+                    queued,
+                )
+                .await;
                 metrics::SCHEDULER_LAST_SUCCESS.store(
                     Utc::now().timestamp() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                record_scheduler_success(&state.stats).await;
                 info!(%delivery_date, delivery = kind.as_str(), queued, "поставлены ежедневные расписания в очередь");
             }
             Ok(_) => {
@@ -151,6 +168,7 @@ async fn daily_schedule_worker(state: AppState) {
                     Utc::now().timestamp() as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                record_scheduler_success(&state.stats).await;
             }
             Err(error) => {
                 error!(%error, %delivery_date, "не удалось поставить ежедневные расписания в очередь")
@@ -193,7 +211,7 @@ async fn connect_redis_with_retry(redis_url: &str) -> Result<RateLimiter> {
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("не удалось подключиться к Redis")))
 }
 
-async fn outbox_worker(bot: Bot, store: Store) {
+async fn outbox_worker(bot: Bot, store: Store, stats: StatsStore) {
     let mut tick = tokio::time::interval(Duration::from_secs(10));
     loop {
         tick.tick().await;
@@ -211,12 +229,14 @@ async fn outbox_worker(bot: Bot, store: Store) {
             {
                 Ok(_) => {
                     metrics::OUTBOX_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    record_stat(&stats, schedule_bot::stats::Metric::OutboxSent, 1).await;
                     if let Err(error) = store.mark_notification_sent(message.id).await {
                         error!(id = message.id, %error, "не удалось отметить уведомление отправленным");
                     }
                 }
                 Err(error) => {
                     metrics::OUTBOX_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    record_stat(&stats, schedule_bot::stats::Metric::OutboxFailed, 1).await;
                     if let Err(mark_error) = store
                         .mark_notification_failed(message.id, &error.to_string())
                         .await
@@ -227,6 +247,19 @@ async fn outbox_worker(bot: Bot, store: Store) {
                 }
             }
         }
+    }
+}
+
+async fn record_stat(stats: &StatsStore, metric: schedule_bot::stats::Metric, amount: u64) {
+    if let Err(error) = stats.record(metric, amount).await {
+        warn!(%error, metric = metric.as_str(), "не удалось записать метрику в Redis");
+    }
+}
+
+async fn record_scheduler_success(stats: &StatsStore) {
+    let timestamp = Utc::now().timestamp() as u64;
+    if let Err(error) = stats.set_scheduler_last_success(timestamp).await {
+        warn!(%error, "не удалось сохранить время успешного запуска планировщика");
     }
 }
 

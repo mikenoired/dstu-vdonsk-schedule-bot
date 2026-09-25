@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ab_glyph = "0.2"
 anyhow = "1"
 axum = "0.8"
 object_store = { version = "0.12", features = ["aws"] }
@@ -13,6 +14,8 @@ chrono.workspace = true
 chrono-tz = "0.10"
 dotenvy = "0.15"
 dptree = "0.5"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+imageproc = { version = "0.27", default-features = false, features = ["text"] }
 hex = "0.4"
 redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
 schedule-parser = { path = "../schedule-parser" }

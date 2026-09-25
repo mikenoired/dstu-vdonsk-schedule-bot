@@ -4,6 +4,7 @@ pub mod format;
 pub mod handlers;
 pub mod metrics;
 pub mod rate_limit;
+pub mod stats;
 pub mod store;
 
 use archive::SourceArchive;
@@ -19,6 +20,7 @@ pub struct AppState {
     pub timezone: Tz,
     pub bot_username: String,
     pub rate_limiter: RateLimiter,
+    pub stats: stats::StatsStore,
     pub archive: Option<SourceArchive>,
 }
 
