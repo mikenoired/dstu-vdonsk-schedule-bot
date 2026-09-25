@@ -153,6 +153,34 @@ impl Store {
         .await?)
     }
 
+    pub async fn chat_group(&self, chat_id: i64) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT group_code FROM chat_schedules WHERE chat_id = $1")
+                .bind(chat_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn set_chat_group(
+        &self,
+        chat_id: i64,
+        group: &str,
+        configured_by: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO chat_schedules (chat_id, group_code, configured_by) VALUES ($1, $2, $3) \
+             ON CONFLICT (chat_id) DO UPDATE SET group_code = EXCLUDED.group_code, \
+             configured_by = EXCLUDED.configured_by, updated_at = now()",
+        )
+        .bind(chat_id)
+        .bind(group)
+        .bind(configured_by)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn set_flow_state(
         &self,
         telegram_id: i64,

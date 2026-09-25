@@ -11,8 +11,8 @@ use teloxide::{
     prelude::*,
     requests::Requester,
     types::{
-        CallbackQuery, ChatId, ChatKind, InlineKeyboardButton, InlineKeyboardMarkup,
-        KeyboardButton, KeyboardMarkup, Message, Update,
+        CallbackQuery, ChatId, ChatKind, ChatMemberKind, InlineKeyboardButton,
+        InlineKeyboardMarkup, KeyboardButton, KeyboardMarkup, Message, PublicChatKind, Update,
     },
 };
 use tokio::io::AsyncWriteExt;
@@ -27,17 +27,50 @@ pub fn schema() -> UpdateHandler<Box<dyn Error + Send + Sync>> {
 }
 
 async fn handle_message(bot: Bot, message: Message, state: AppState) -> HandlerResult {
-    if !matches!(message.chat.kind, ChatKind::Private(_)) {
-        return Ok(());
-    }
     let Some(from) = message.from.as_ref() else {
         return Ok(());
     };
     let user_id = from.id.0 as i64;
+    let username = from.username.clone();
+    let chat_id = message.chat.id.0;
+    match &message.chat.kind {
+        ChatKind::Private(_) => {
+            if !state.rate_limiter.allow(user_id, chat_id) {
+                if state.rate_limiter.should_warn(user_id) {
+                    send_text(
+                        &bot,
+                        message.chat.id,
+                        "Слишком много запросов подряд. Подожди немного и попробуй ещё раз.",
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
+            handle_private_message(bot, message, state, user_id, username.as_deref()).await
+        }
+        ChatKind::Public(chat)
+            if matches!(
+                chat.kind,
+                PublicChatKind::Group | PublicChatKind::Supergroup(_)
+            ) =>
+        {
+            handle_group_message(bot, message, state, user_id).await
+        }
+        ChatKind::Public(_) => Ok(()),
+    }
+}
+
+async fn handle_private_message(
+    bot: Bot,
+    message: Message,
+    state: AppState,
+    user_id: i64,
+    username: Option<&str>,
+) -> HandlerResult {
     let chat_id = message.chat.id.0;
     state
         .store
-        .register_user(user_id, chat_id, from.username.as_deref())
+        .register_user(user_id, chat_id, username)
         .await?;
 
     if let Some(text) = message.text() {
@@ -121,6 +154,137 @@ async fn handle_message(bot: Bot, message: Message, state: AppState) -> HandlerR
         }
     }
     Ok(())
+}
+
+async fn handle_group_message(
+    bot: Bot,
+    message: Message,
+    state: AppState,
+    user_id: i64,
+) -> HandlerResult {
+    let Some(text) = message.text().map(str::trim) else {
+        return Ok(());
+    };
+    let Some((command, args)) = parse_group_command(text, &state.bot_username) else {
+        return Ok(());
+    };
+    let chat_id = message.chat.id;
+    if !state.rate_limiter.allow(user_id, chat_id.0) {
+        return Ok(());
+    }
+
+    match command.as_str() {
+        "setgroup" => {
+            let member = match bot.get_chat_member(chat_id, UserId(user_id as u64)).await {
+                Ok(member) => member,
+                Err(_) => {
+                    send_text(
+                        &bot,
+                        chat_id,
+                        "Не удалось проверить права в чате. Убедись, что бот добавлен в группу и назначен администратором с минимальными разрешениями, затем повтори команду.",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            if !matches!(member.kind, ChatMemberKind::Owner(_) | ChatMemberKind::Administrator(_)) {
+                send_text(&bot, chat_id, "Привязать учебную группу могут только администраторы чата.").await?;
+                return Ok(());
+            }
+            let Some(requested) = single_argument(&args) else {
+                send_text(&bot, chat_id, "Использование: /setgroup ИС11В").await?;
+                return Ok(());
+            };
+            let group = state
+                .store
+                .known_groups()
+                .await?
+                .into_iter()
+                .find(|group| group.eq_ignore_ascii_case(requested));
+            let Some(group) = group else {
+                send_text(&bot, chat_id, "Такой группы нет в опубликованном расписании. Проверь написание.").await?;
+                return Ok(());
+            };
+            state.store.set_chat_group(chat_id.0, &group, user_id).await?;
+            send_text(
+                &bot,
+                chat_id,
+                &format!("✅ Чат привязан к группе {group}. Доступны /today, /week и /day ДД.ММ.ГГГГ."),
+            )
+            .await?;
+        }
+        "group" => match state.store.chat_group(chat_id.0).await? {
+            Some(group) => send_text(&bot, chat_id, &format!("Для этого чата выбрана группа {group}."))
+                .await?,
+            None => send_text(&bot, chat_id, "Группа ещё не выбрана. Администратор чата может задать её командой /setgroup ИС11В.")
+                .await?,
+        },
+        "today" | "week" | "day" => {
+            let Some(group) = state.store.chat_group(chat_id.0).await? else {
+                send_text(&bot, chat_id, "Группа ещё не выбрана. Администратор чата может задать её командой /setgroup ИС11В.")
+                    .await?;
+                return Ok(());
+            };
+            let date = if command == "day" {
+                let Some(date) = single_argument(&args)
+                    .and_then(|value| NaiveDate::parse_from_str(value, "%d.%m.%Y").ok())
+                else {
+                    send_text(&bot, chat_id, "Использование: /day 28.09.2026").await?;
+                    return Ok(());
+                };
+                date
+            } else {
+                state.today()
+            };
+            let lessons = if command == "week" {
+                state.store.week_lessons(&group, date).await?
+            } else {
+                state.store.today_lessons(&group, date).await?
+            };
+            if lessons.is_empty() {
+                let label = if command == "week" {
+                    format!("На неделю для группы {group} расписания не нашёл.")
+                } else {
+                    format!("На {} для группы {group} пар не нашёл.", date.format("%d.%m.%Y"))
+                };
+                send_text(&bot, chat_id, &label).await?;
+            } else {
+                let title = match command.as_str() {
+                    "week" => format!("На неделю · группа {group}"),
+                    "today" => format!("Сегодня · группа {group}"),
+                    _ => format!("{} · группа {group}", date.format("%d.%m.%Y")),
+                };
+                send_schedule(&bot, chat_id, &title, &lessons, command != "today").await?;
+            }
+        }
+        "help" | "start" => send_text(&bot, chat_id, group_help_text()).await?,
+        _ => send_text(&bot, chat_id, group_help_text()).await?,
+    }
+    Ok(())
+}
+
+fn parse_group_command(text: &str, bot_username: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = text.split_whitespace();
+    let command = parts.next()?;
+    let command = command.strip_prefix('/')?;
+    let (name, mention) = command
+        .split_once('@')
+        .map_or((command, None), |(name, mention)| (name, Some(mention)));
+    if mention.is_some_and(|mention| !mention.eq_ignore_ascii_case(bot_username)) {
+        return None;
+    }
+    Some((
+        name.to_ascii_lowercase(),
+        parts.map(str::to_owned).collect(),
+    ))
+}
+
+fn single_argument(args: &[String]) -> Option<&str> {
+    (args.len() == 1).then(|| args[0].as_str())
+}
+
+fn group_help_text() -> &'static str {
+    "Команды расписания в группе:\n/setgroup ИС11В — привязать группу (только администратор чата)\n/group — показать выбранную группу\n/today — расписание на сегодня\n/week — расписание на неделю\n/day 28.09.2026 — расписание на дату"
 }
 
 async fn handle_start(
@@ -211,6 +375,18 @@ async fn handle_group_input(
 async fn handle_callback(bot: Bot, query: CallbackQuery, state: AppState) -> HandlerResult {
     let user_id = query.from.id.0 as i64;
     let chat_id = ChatId(user_id);
+    if !state.rate_limiter.allow(user_id, chat_id.0) {
+        bot.answer_callback_query(query.id.clone()).await?;
+        if state.rate_limiter.should_warn(user_id) {
+            send_text(
+                &bot,
+                chat_id,
+                "Слишком много запросов подряд. Подожди немного и попробуй ещё раз.",
+            )
+            .await?;
+        }
+        return Ok(());
+    }
     let data = query.data.as_deref().unwrap_or("").to_owned();
     bot.answer_callback_query(query.id.clone()).await?;
     state
@@ -743,10 +919,36 @@ fn publication_message(publication: &crate::store::Publication) -> String {
 }
 
 fn help_text() -> &'static str {
-    "Команды и меню:\n/start — начать или открыть меню\n/admin_link — создать одноразовую ссылку администратора\n\nДля студентов доступны расписание на сегодня, на неделю и поиск по преподавателю или аудитории."
+    "Команды и меню:\n/start — начать или открыть меню\n/admin_link — создать одноразовую ссылку администратора\n\nДля студентов доступны расписание на сегодня, на неделю и поиск по преподавателю или аудитории. В группах: /setgroup, /today, /week, /day."
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_group_command;
+
+    #[test]
+    fn parses_group_command_and_arguments() {
+        assert_eq!(
+            parse_group_command("/day@ScheduleBot 28.09.2026", "schedulebot"),
+            Some(("day".to_owned(), vec!["28.09.2026".to_owned()]))
+        );
+    }
+
+    #[test]
+    fn ignores_commands_mentioned_to_another_bot() {
+        assert_eq!(parse_group_command("/today@OtherBot", "schedulebot"), None);
+    }
+
+    #[test]
+    fn parses_commands_without_explicit_mention() {
+        assert_eq!(
+            parse_group_command("/week", "schedulebot"),
+            Some(("week".to_owned(), vec![]))
+        );
+    }
 }

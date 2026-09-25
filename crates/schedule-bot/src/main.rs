@@ -1,7 +1,13 @@
 use anyhow::{Context, Result, bail};
 use schedule_bot::{AppState, handlers, store::Store};
 use std::{env, time::Duration};
-use teloxide::{Bot, dispatching::Dispatcher, prelude::Requester};
+use teloxide::{
+    Bot,
+    dispatching::Dispatcher,
+    payloads::SetMyCommandsSetters,
+    prelude::Requester,
+    types::{BotCommand, BotCommandScope},
+};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -45,11 +51,25 @@ async fn main() -> Result<()> {
         .await
         .context("не удалось проверить TELEGRAM_BOT_TOKEN")?;
     info!(bot = ?me.username(), "бот запущен");
+    let bot_username = me.username().to_owned();
+    bot.set_my_commands([
+        BotCommand::new("setgroup", "привязать группу к чату"),
+        BotCommand::new("group", "показать привязанную группу"),
+        BotCommand::new("today", "расписание на сегодня"),
+        BotCommand::new("week", "расписание на неделю"),
+        BotCommand::new("day", "расписание на дату"),
+        BotCommand::new("help", "команды расписания"),
+    ])
+    .scope(BotCommandScope::AllGroupChats)
+    .await
+    .context("не удалось зарегистрировать команды для групп")?;
 
     let state = AppState {
         store,
         bootstrap_token,
         timezone,
+        bot_username,
+        rate_limiter: Default::default(),
     };
     tokio::spawn(outbox_worker(bot.clone(), state.store.clone()));
 

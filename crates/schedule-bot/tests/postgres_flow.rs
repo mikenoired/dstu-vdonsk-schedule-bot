@@ -13,6 +13,11 @@ async fn registration_admin_group_publish_correction_and_outbox(
     store.register_user(202, 202, Some("student")).await?;
     store.register_user(303, 303, Some("next-admin")).await?;
 
+    store.set_chat_group(-1001, "ИС11В", 101).await?;
+    assert_eq!(store.chat_group(-1001).await?.as_deref(), Some("ИС11В"));
+    store.set_chat_group(-1001, "КТО11В", 303).await?;
+    assert_eq!(store.chat_group(-1001).await?.as_deref(), Some("КТО11В"));
+
     assert!(store.claim_bootstrap_admin(101).await?);
     assert!(!store.claim_bootstrap_admin(303).await?);
     assert!(store.is_admin(101).await?);
