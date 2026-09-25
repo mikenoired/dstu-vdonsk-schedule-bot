@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
-use schedule_bot::{AppState, handlers, store::Store};
+use chrono::{NaiveDate, NaiveTime, Utc};
+use schedule_bot::{AppState, format::DailyKind, handlers, store::Store};
 use std::{env, time::Duration};
 use teloxide::{
     Bot,
@@ -72,6 +73,7 @@ async fn main() -> Result<()> {
         rate_limiter: Default::default(),
     };
     tokio::spawn(outbox_worker(bot.clone(), state.store.clone()));
+    tokio::spawn(daily_schedule_worker(state.clone()));
 
     Dispatcher::builder(bot, handlers::schema())
         .dependencies(dptree::deps![state])
@@ -80,6 +82,42 @@ async fn main() -> Result<()> {
         .dispatch()
         .await;
     Ok(())
+}
+
+fn due_daily_delivery(now: chrono::DateTime<chrono_tz::Tz>) -> Option<(NaiveDate, DailyKind)> {
+    let morning = NaiveTime::from_hms_opt(7, 0, 0).expect("valid time");
+    let evening = NaiveTime::from_hms_opt(21, 0, 0).expect("valid time");
+    if now.time() >= evening {
+        Some((now.date_naive() + chrono::Days::new(1), DailyKind::Tomorrow))
+    } else if now.time() >= morning {
+        Some((now.date_naive(), DailyKind::Today))
+    } else {
+        None
+    }
+}
+
+async fn daily_schedule_worker(state: AppState) {
+    let mut tick = tokio::time::interval(Duration::from_secs(15));
+    loop {
+        tick.tick().await;
+        let now = Utc::now().with_timezone(&state.timezone);
+        let Some((delivery_date, kind)) = due_daily_delivery(now) else {
+            continue;
+        };
+        match state
+            .store
+            .enqueue_daily_schedules(delivery_date, kind)
+            .await
+        {
+            Ok(queued) if queued > 0 => {
+                info!(%delivery_date, delivery = kind.as_str(), queued, "поставлены ежедневные расписания в очередь");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(%error, %delivery_date, "не удалось поставить ежедневные расписания в очередь")
+            }
+        }
+    }
 }
 
 fn required_env(name: &str) -> Result<String> {
@@ -133,5 +171,49 @@ async fn outbox_worker(bot: Bot, store: Store) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::due_daily_delivery;
+    use chrono::{NaiveDate, TimeZone};
+    use schedule_bot::format::DailyKind;
+
+    #[test]
+    fn selects_morning_delivery_at_seven_local_time() {
+        let timezone = chrono_tz::Europe::Moscow;
+        let before = timezone
+            .with_ymd_and_hms(2026, 9, 25, 6, 59, 59)
+            .single()
+            .unwrap();
+        let due = timezone
+            .with_ymd_and_hms(2026, 9, 25, 7, 0, 0)
+            .single()
+            .unwrap();
+        assert_eq!(due_daily_delivery(before), None);
+        assert_eq!(
+            due_daily_delivery(due),
+            Some((
+                NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
+                DailyKind::Today
+            ))
+        );
+    }
+
+    #[test]
+    fn selects_tomorrow_delivery_at_nine_local_time() {
+        let timezone = chrono_tz::Europe::Moscow;
+        let due = timezone
+            .with_ymd_and_hms(2026, 9, 25, 21, 0, 0)
+            .single()
+            .unwrap();
+        assert_eq!(
+            due_daily_delivery(due),
+            Some((
+                NaiveDate::from_ymd_opt(2026, 9, 26).unwrap(),
+                DailyKind::Tomorrow
+            ))
+        );
     }
 }

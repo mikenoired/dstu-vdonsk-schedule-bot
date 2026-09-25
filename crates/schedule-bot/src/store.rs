@@ -1,4 +1,5 @@
 use crate::domain::{ScheduleDiff, UpdateKind, compare_schedules, validate_schedule};
+use crate::format::{DailyKind, format_daily_delivery};
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use schedule_parser::{Lesson, display_room_name};
@@ -179,6 +180,65 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn enqueue_daily_schedules(
+        &self,
+        delivery_date: NaiveDate,
+        kind: DailyKind,
+    ) -> Result<u64> {
+        let recipients: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT telegram_id, group_code FROM users WHERE group_code IS NOT NULL ORDER BY telegram_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        if recipients.is_empty() {
+            return Ok(0);
+        }
+
+        let groups = recipients
+            .iter()
+            .map(|(_, group)| group.clone())
+            .collect::<BTreeSet<_>>();
+        let mut lessons_by_group = std::collections::HashMap::new();
+        for group in groups {
+            lessons_by_group.insert(
+                group.clone(),
+                self.today_lessons(&group, delivery_date).await?,
+            );
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let mut queued = 0;
+        for (telegram_id, group) in recipients {
+            let inserted = sqlx::query_scalar::<_, i64>(
+                "INSERT INTO scheduled_deliveries (telegram_id, delivery_date, delivery_kind) \
+                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING telegram_id",
+            )
+            .bind(telegram_id)
+            .bind(delivery_date)
+            .bind(kind.as_str())
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+            if !inserted {
+                continue;
+            }
+
+            let lessons = lessons_by_group
+                .get(&group)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let body = format_daily_delivery(&group, delivery_date, kind, lessons);
+            sqlx::query("INSERT INTO notification_outbox (telegram_id, body) VALUES ($1, $2)")
+                .bind(telegram_id)
+                .bind(body)
+                .execute(&mut *tx)
+                .await?;
+            queued += 1;
+        }
+        tx.commit().await?;
+        Ok(queued)
     }
 
     pub async fn set_flow_state(

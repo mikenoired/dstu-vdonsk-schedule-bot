@@ -1,4 +1,5 @@
 use crate::AppState;
+use crate::format::format_schedule;
 use anyhow::{Context, Result, anyhow};
 use chrono::NaiveDate;
 use schedule_parser::Lesson;
@@ -766,41 +767,7 @@ async fn send_schedule(
     lessons: &[Lesson],
     show_dates: bool,
 ) -> Result<()> {
-    let mut lines = vec![title.to_owned(), "━━━━━━━━━━━━━━━━".to_owned()];
-    let mut current_date: Option<NaiveDate> = None;
-    for lesson in lessons {
-        if show_dates && current_date != Some(lesson.date) {
-            lines.push(String::new());
-            lines.push(format!(
-                "🗓️ {} · {}",
-                lesson.weekday,
-                lesson.date.format("%d.%m.%Y")
-            ));
-            current_date = Some(lesson.date);
-        }
-        lines.push(format!(
-            "🕒 {}–{} · пара №{}",
-            lesson.start_time, lesson.end_time, lesson.lesson_number
-        ));
-        lines.push(format!("👥 {}", lesson.groups.join(", ")));
-        lines.push(format!("📖 {}", lesson.subject));
-        let mut details = Vec::new();
-        if let Some(kind) = &lesson.lesson_type {
-            details.push(format!("🧩 {kind}"));
-        }
-        if let Some(teacher) = &lesson.teacher {
-            details.push(format!("👩‍🏫 {teacher}"));
-        }
-        if let Some(room) = &lesson.room {
-            details.push(format!("📍 {room}"));
-        }
-        if !details.is_empty() {
-            lines.push(details.join(" · "));
-        }
-        lines.push(String::new());
-    }
-    lines.push(format!("✨ Всего пар: {}", lessons.len()));
-    send_long_text(bot, chat_id, &lines.join("\n")).await
+    send_long_text(bot, chat_id, &format_schedule(title, lessons, show_dates)).await
 }
 
 async fn send_long_text(bot: &Bot, chat_id: ChatId, text: &str) -> Result<()> {

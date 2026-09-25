@@ -1,5 +1,5 @@
 use chrono::NaiveDate;
-use schedule_bot::{domain::UpdateKind, store::Store};
+use schedule_bot::{domain::UpdateKind, format::DailyKind, store::Store};
 use schedule_parser::Lesson;
 use sqlx::PgPool;
 
@@ -104,6 +104,30 @@ async fn registration_admin_group_publish_correction_and_outbox(
     let new_week_notice = store.ready_notifications(10).await?;
     assert_eq!(new_week_notice.len(), 1);
     assert!(new_week_notice[0].body.contains("новую неделю"));
+    store.mark_notification_sent(new_week_notice[0].id).await?;
+
+    let target_date = NaiveDate::from_ymd_opt(2026, 10, 6).unwrap();
+    assert_eq!(
+        store
+            .enqueue_daily_schedules(target_date, DailyKind::Tomorrow)
+            .await?,
+        1
+    );
+    assert_eq!(
+        store
+            .enqueue_daily_schedules(target_date, DailyKind::Tomorrow)
+            .await?,
+        0
+    );
+    let daily_notice = store.ready_notifications(10).await?;
+    assert_eq!(daily_notice.len(), 1);
+    assert!(daily_notice[0].body.contains("🌙 План на завтра"));
+    assert!(daily_notice[0].body.contains("Группа ИС11В"));
+    assert!(
+        daily_notice[0]
+            .body
+            .contains("📭 По опубликованному расписанию занятий нет.")
+    );
     Ok(())
 }
 

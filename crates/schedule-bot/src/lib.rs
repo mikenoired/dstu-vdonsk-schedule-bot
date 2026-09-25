@@ -1,4 +1,5 @@
 pub mod domain;
+pub mod format;
 pub mod handlers;
 pub mod rate_limit;
 pub mod store;
