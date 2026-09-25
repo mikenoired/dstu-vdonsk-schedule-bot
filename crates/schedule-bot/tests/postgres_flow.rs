@@ -70,7 +70,8 @@ async fn registration_admin_group_publish_correction_and_outbox(
         .preview_upload(101, "week.xls", &"a".repeat(64), reparsed_lessons.clone())
         .await?;
     assert_eq!(reparsed.kind, UpdateKind::Correction);
-    assert_eq!(reparsed.diff.added, 1);
+    // One shared lesson is counted once for each affected group.
+    assert_eq!(reparsed.diff.added, 2);
     store.confirm_upload(reparsed.id, 101).await?;
     let reparse_notice = store.ready_notifications(10).await?;
     assert_eq!(reparse_notice.len(), 1);
