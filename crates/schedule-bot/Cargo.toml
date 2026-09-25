@@ -7,11 +7,14 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1"
+axum = "0.8"
+object_store = { version = "0.12", features = ["aws"] }
 chrono.workspace = true
 chrono-tz = "0.10"
 dotenvy = "0.15"
 dptree = "0.5"
 hex = "0.4"
+redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
 schedule-parser = { path = "../schedule-parser" }
 serde.workspace = true
 serde_json.workspace = true
@@ -20,7 +23,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-r
 subtle = "2"
 teloxide = { version = "0.17", features = ["macros", "ctrlc_handler"] }
 thiserror.workspace = true
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }

@@ -4,7 +4,6 @@ use schedule_parser::Lesson;
 use sqlx::PgPool;
 
 #[sqlx::test]
-#[ignore = "requires a PostgreSQL superuser in DATABASE_URL; run explicitly to exercise transactions"]
 async fn registration_admin_group_publish_correction_and_outbox(
     pool: PgPool,
 ) -> anyhow::Result<()> {
@@ -12,11 +11,14 @@ async fn registration_admin_group_publish_correction_and_outbox(
     store.register_user(101, 101, Some("admin")).await?;
     store.register_user(202, 202, Some("student")).await?;
     store.register_user(303, 303, Some("next-admin")).await?;
+    store.register_user(404, 404, Some("opted-out")).await?;
 
     store.set_chat_group(-1001, "ИС11В", 101).await?;
     assert_eq!(store.chat_group(-1001).await?.as_deref(), Some("ИС11В"));
     store.set_chat_group(-1001, "КТО11В", 303).await?;
     assert_eq!(store.chat_group(-1001).await?.as_deref(), Some("КТО11В"));
+    assert!(store.remove_chat_group(-1001).await?);
+    assert_eq!(store.chat_group(-1001).await?, None);
 
     assert!(store.claim_bootstrap_admin(101).await?);
     assert!(!store.claim_bootstrap_admin(303).await?);
@@ -39,11 +41,25 @@ async fn registration_admin_group_publish_correction_and_outbox(
         .await?;
     assert_eq!(preview.kind, UpdateKind::NewWeek);
     assert_eq!(preview.diff.changed_groups, ["ИС11В", "КТО11В"]);
+    store
+        .attach_source_key(preview.id, 101, "schedule-sources/test.xls")
+        .await?;
     store.confirm_upload(preview.id, 101).await?;
+    let archived_key: String =
+        sqlx::query_scalar("SELECT source_object_key FROM schedule_versions")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(archived_key, "schedule-sources/test.xls");
     assert_eq!(store.known_groups().await?, ["ИС11В", "КТО11В"]);
 
     store.set_pending_group(202, "ИС11В").await?;
     assert_eq!(store.confirm_group(202).await?.as_deref(), Some("ИС11В"));
+    store.set_daily_notifications(202, false).await?;
+    assert!(!store.user(202).await?.unwrap().daily_notifications_enabled);
+    store.set_daily_notifications(202, true).await?;
+    store.set_pending_group(404, "ИС11В").await?;
+    store.confirm_group(404).await?;
+    store.set_daily_notifications(404, false).await?;
 
     let mut second_pair = shared_lesson.clone();
     second_pair.lesson_number = 2;

@@ -265,6 +265,17 @@ fn parse_description(description: &str) -> (String, Option<String>, Option<Strin
             .then_some((start, start + end + 1, inside.trim().to_owned()))
     });
     let Some((start, end, kind)) = type_start else {
+        let lower = description.to_lowercase();
+        if let Some(start) = lower.find(", ст. преп.") {
+            let marker_end = start + ", ст. преп.".len();
+            if let Some(teacher_name) = non_empty(&description[marker_end..]) {
+                return (
+                    description[..start].trim().to_owned(),
+                    None,
+                    Some(format!("ст. преп. {teacher_name}")),
+                );
+            }
+        }
         return (description.trim().to_owned(), None, None);
     };
     let subject = description[..start]
@@ -289,6 +300,15 @@ mod tests {
         assert_eq!(subject, "Основы инклюзивной культуры");
         assert_eq!(kind.as_deref(), Some("пр.+пр."));
         assert_eq!(teacher.as_deref(), Some("доц. Усова И.В."));
+    }
+
+    #[test]
+    fn parses_teacher_suffix_on_curator_hour() {
+        let (subject, kind, teacher) =
+            parse_description("Кураторский час, ст. преп. Ерёменко Т.В.");
+        assert_eq!(subject, "Кураторский час");
+        assert_eq!(kind, None);
+        assert_eq!(teacher.as_deref(), Some("ст. преп. Ерёменко Т.В."));
     }
 
     #[test]

@@ -83,3 +83,95 @@ fn preserves_joint_group_headers_as_individual_groups() {
             .any(|lesson| lesson.groups.iter().any(|group| group == "ОЗЭ21В"))
     );
 }
+
+#[test]
+fn parses_the_four_attached_consecutive_weekly_workbooks() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tables");
+    let workbooks = [
+        (
+            "2_ОФО_ОЗФО_Расписание 2 учебной недели осеннего семестра (07.09.2026-13.09.2026) (1).xls",
+            NaiveDate::from_ymd_opt(2026, 9, 7).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 13).unwrap(),
+            178,
+            25,
+        ),
+        (
+            "3_ОФО_ОЗФО_Расписание 3 учебной недели осеннего семестра (14.09.2026-20.09.2026).xls",
+            NaiveDate::from_ymd_opt(2026, 9, 14).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 20).unwrap(),
+            161,
+            22,
+        ),
+        (
+            "4_ОФО_ОЗФО_Расписание 4 учебной недели осеннего семестра (21.09.2026-27.09.2026).xls",
+            NaiveDate::from_ymd_opt(2026, 9, 21).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 27).unwrap(),
+            179,
+            25,
+        ),
+        (
+            "5_ОФО_ОЗФО_Расписание 5 учебной недели осеннего семестра (28.09.2026-04.10.2026).xls",
+            NaiveDate::from_ymd_opt(2026, 9, 28).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 10, 4).unwrap(),
+            186,
+            25,
+        ),
+    ];
+
+    for (file, start, end, expected_lessons, expected_groups) in workbooks {
+        let lessons = parse_file(root.join(file)).unwrap_or_else(|error| panic!("{file}: {error}"));
+        assert!(!lessons.is_empty(), "{file}: расписание пустое");
+        assert!(
+            lessons
+                .iter()
+                .all(|lesson| (start..=end).contains(&lesson.date)),
+            "{file}: есть занятие вне заявленной недели"
+        );
+        assert_eq!(
+            lessons.len(),
+            expected_lessons,
+            "{file}: количество занятий изменилось"
+        );
+        assert!(
+            lessons
+                .iter()
+                .all(|lesson| !lesson.groups.is_empty() && !lesson.subject.is_empty()),
+            "{file}: найдена пара без группы или дисциплины"
+        );
+        let groups = lessons
+            .iter()
+            .flat_map(|lesson| lesson.groups.iter())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            groups.len(),
+            expected_groups,
+            "{file}: количество групп изменилось"
+        );
+        let dates = lessons
+            .iter()
+            .map(|lesson| lesson.date)
+            .collect::<std::collections::BTreeSet<_>>();
+        let weekdays = lessons
+            .iter()
+            .map(|lesson| lesson.weekday.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(dates.len(), 6, "{file}: ожидалось 6 дней с парами");
+        assert_eq!(weekdays.len(), 6, "{file}: не распознан день недели");
+        assert!(
+            lessons
+                .iter()
+                .filter(|lesson| lesson
+                    .description
+                    .to_lowercase()
+                    .starts_with("кураторский час, ст. преп."))
+                .all(|lesson| {
+                    lesson.subject == "Кураторский час"
+                        && lesson
+                            .teacher
+                            .as_deref()
+                            .is_some_and(|teacher| teacher.starts_with("ст. преп."))
+                }),
+            "{file}: некорректно разобран преподаватель кураторского часа"
+        );
+    }
+}

@@ -1,104 +1,103 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+use anyhow::{Context, Result};
+use redis::{AsyncCommands, aio::ConnectionManager};
 
-const WINDOW: Duration = Duration::from_secs(10);
-const USER_LIMIT: usize = 6;
-const CHAT_LIMIT: usize = 24;
-const WARNING_COOLDOWN: Duration = Duration::from_secs(30);
+const WINDOW_MS: u64 = 10_000;
+const USER_LIMIT: u64 = 6;
+const CHAT_LIMIT: u64 = 24;
+const WARNING_COOLDOWN_MS: u64 = 30_000;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-enum Key {
-    User(i64),
-    Chat(i64),
+#[derive(Clone)]
+pub struct RateLimiter {
+    redis: ConnectionManager,
 }
-
-#[derive(Default)]
-struct State {
-    requests: HashMap<Key, VecDeque<Instant>>,
-    last_warning: HashMap<i64, Instant>,
-}
-
-/// In-process sliding-window limiter shared across private and group handlers.
-#[derive(Clone, Default)]
-pub struct RateLimiter(Arc<Mutex<State>>);
 
 impl RateLimiter {
-    pub fn allow(&self, user_id: i64, chat_id: i64) -> bool {
-        let now = Instant::now();
-        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        prune(&mut state, now);
+    pub async fn connect(redis_url: &str) -> Result<Self> {
+        let client = redis::Client::open(redis_url).context("неверный REDIS_URL")?;
+        let redis = client
+            .get_connection_manager()
+            .await
+            .context("не удалось подключиться к Redis")?;
+        Ok(Self { redis })
+    }
 
-        let user_key = Key::User(user_id);
-        let chat_key = Key::Chat(chat_id);
-        let user_requests = state.requests.get(&user_key).map_or(0, VecDeque::len);
-        let chat_requests = state.requests.get(&chat_key).map_or(0, VecDeque::len);
-        if user_requests >= USER_LIMIT || chat_requests >= CHAT_LIMIT {
-            return false;
-        }
-
-        state.requests.entry(user_key).or_default().push_back(now);
-        state.requests.entry(chat_key).or_default().push_back(now);
-        true
+    pub async fn allow(&self, user_id: i64, chat_id: i64) -> Result<bool> {
+        let script = redis::Script::new(
+            "local t=redis.call('TIME'); \
+             local now=t[1]*1000+math.floor(t[2]/1000); \
+             local window=tonumber(ARGV[1]); \
+             for i,key in ipairs(KEYS) do redis.call('ZREMRANGEBYSCORE',key,'-inf',now-window); end; \
+             local uc=redis.call('ZCARD',KEYS[1]); local cc=redis.call('ZCARD',KEYS[2]); \
+             if uc>=tonumber(ARGV[2]) or cc>=tonumber(ARGV[3]) then return 0 end; \
+             redis.call('ZADD',KEYS[1],now,ARGV[4]); redis.call('ZADD',KEYS[2],now,ARGV[4]); \
+             redis.call('PEXPIRE',KEYS[1],window*2); redis.call('PEXPIRE',KEYS[2],window*2); return 1",
+        );
+        let mut redis = self.redis.clone();
+        let allowed: i64 = script
+            .key(format!("schedule:limit:user:{user_id}"))
+            .key(format!("schedule:limit:chat:{chat_id}"))
+            .arg(WINDOW_MS)
+            .arg(USER_LIMIT)
+            .arg(CHAT_LIMIT)
+            .arg(uuid::Uuid::new_v4().to_string())
+            .invoke_async(&mut redis)
+            .await
+            .context("ошибка Redis при проверке лимита запросов")?;
+        Ok(allowed == 1)
     }
 
     /// Return true at most once per user during the warning cooldown.
-    pub fn should_warn(&self, user_id: i64) -> bool {
-        let now = Instant::now();
-        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        match state.last_warning.get(&user_id) {
-            Some(last) if now.duration_since(*last) < WARNING_COOLDOWN => false,
-            _ => {
-                state.last_warning.insert(user_id, now);
-                true
-            }
-        }
+    pub async fn should_warn(&self, user_id: i64) -> Result<bool> {
+        let mut redis = self.redis.clone();
+        let inserted: Option<String> = redis
+            .set_options(
+                format!("schedule:limit:warning:{user_id}"),
+                "1",
+                redis::SetOptions::default()
+                    .conditional_set(redis::ExistenceCheck::NX)
+                    .get(false)
+                    .with_expiration(redis::SetExpiry::PX(WARNING_COOLDOWN_MS)),
+            )
+            .await
+            .context("ошибка Redis при установке периода предупреждения")?;
+        Ok(inserted.is_some())
     }
-}
 
-fn prune(state: &mut State, now: Instant) {
-    state.requests.retain(|_, requests| {
-        while requests
-            .front()
-            .is_some_and(|request| now.duration_since(*request) >= WINDOW)
-        {
-            requests.pop_front();
-        }
-        !requests.is_empty()
-    });
-    state
-        .last_warning
-        .retain(|_, last| now.duration_since(*last) < WARNING_COOLDOWN);
+    pub async fn health(&self) -> Result<()> {
+        let mut redis = self.redis.clone();
+        let _: String = redis::cmd("PING")
+            .query_async(&mut redis)
+            .await
+            .context("ошибка Redis health check")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn limits_one_user_across_multiple_chats() {
-        let limiter = RateLimiter::default();
+    #[tokio::test]
+    async fn redis_limits_a_user_across_chats() -> Result<()> {
+        let url = std::env::var("REDIS_URL")
+            .context("REDIS_URL is required for this integration test")?;
+        let limiter = RateLimiter::connect(&url).await?;
+        let user = uuid::Uuid::new_v4().as_u128() as i64;
         for index in 0..USER_LIMIT {
-            assert!(limiter.allow(10, index as i64));
+            assert!(limiter.allow(user, user + index as i64 + 1).await?);
         }
-        assert!(!limiter.allow(10, 999));
+        assert!(!limiter.allow(user, user + 100).await?);
+        Ok(())
     }
 
-    #[test]
-    fn limits_total_traffic_in_one_group() {
-        let limiter = RateLimiter::default();
-        for user_id in 0..CHAT_LIMIT as i64 {
-            assert!(limiter.allow(user_id, -100));
-        }
-        assert!(!limiter.allow(999, -100));
-    }
-
-    #[test]
-    fn warning_is_suppressed_during_cooldown() {
-        let limiter = RateLimiter::default();
-        assert!(limiter.should_warn(42));
-        assert!(!limiter.should_warn(42));
+    #[tokio::test]
+    async fn redis_suppresses_repeat_warning_during_cooldown() -> Result<()> {
+        let url = std::env::var("REDIS_URL")
+            .context("REDIS_URL is required for this integration test")?;
+        let limiter = RateLimiter::connect(&url).await?;
+        let user = uuid::Uuid::new_v4().as_u128() as i64;
+        assert!(limiter.should_warn(user).await?);
+        assert!(!limiter.should_warn(user).await?);
+        Ok(())
     }
 }

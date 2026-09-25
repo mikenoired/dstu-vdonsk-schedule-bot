@@ -24,6 +24,7 @@ pub struct User {
     pub pending_group: Option<String>,
     pub flow_state: String,
     pub search_kind: Option<String>,
+    pub daily_notifications_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +89,19 @@ impl Store {
         Self { pool }
     }
 
+    pub async fn health(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn queued_notifications(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT count(*) FROM notification_outbox WHERE sent_at IS NULL AND attempts < 8",
+        )
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     pub async fn connect(database_url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(5)
@@ -125,7 +139,7 @@ impl Store {
 
     pub async fn user(&self, telegram_id: i64) -> Result<Option<User>> {
         Ok(sqlx::query_as::<_, UserRow>(
-            "SELECT telegram_id, chat_id, role, group_code, pending_group, flow_state, search_kind \
+            "SELECT telegram_id, chat_id, role, group_code, pending_group, flow_state, search_kind, daily_notifications_enabled \
              FROM users WHERE telegram_id = $1",
         )
         .bind(telegram_id)
@@ -182,13 +196,31 @@ impl Store {
         Ok(())
     }
 
+    pub async fn remove_chat_group(&self, chat_id: i64) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM chat_schedules WHERE chat_id = $1")
+            .bind(chat_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn set_daily_notifications(&self, telegram_id: i64, enabled: bool) -> Result<()> {
+        sqlx::query("UPDATE users SET daily_notifications_enabled = $2, updated_at = now() WHERE telegram_id = $1")
+            .bind(telegram_id)
+            .bind(enabled)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn enqueue_daily_schedules(
         &self,
         delivery_date: NaiveDate,
         kind: DailyKind,
     ) -> Result<u64> {
         let recipients: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT telegram_id, group_code FROM users WHERE group_code IS NOT NULL ORDER BY telegram_id",
+            "SELECT telegram_id, group_code FROM users WHERE group_code IS NOT NULL \
+             AND daily_notifications_enabled ORDER BY telegram_id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -484,7 +516,8 @@ impl Store {
         let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO pending_uploads (id, uploaded_by, file_name, file_sha256, week_start, week_end, \
-             update_kind, base_version, diff, parsed_lessons) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+             update_kind, base_version, diff, parsed_lessons) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(id)
         .bind(admin_id)
@@ -508,6 +541,19 @@ impl Store {
         })
     }
 
+    pub async fn attach_source_key(&self, upload_id: Uuid, admin_id: i64, key: &str) -> Result<()> {
+        let result = sqlx::query("UPDATE pending_uploads SET source_object_key = $3 WHERE id = $1 AND uploaded_by = $2 AND status = 'pending'")
+            .bind(upload_id)
+            .bind(admin_id)
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() != 1 {
+            bail!("не удалось связать исходный файл с предпросмотром");
+        }
+        Ok(())
+    }
+
     async fn lessons_by_version(&self, version: Uuid) -> Result<Vec<Lesson>> {
         let rows = sqlx::query_as::<_, DbLesson>(
             "SELECT groups, lesson_date, weekday, lesson_number, start_time, end_time, subject, \
@@ -520,15 +566,18 @@ impl Store {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    pub async fn cancel_upload(&self, id: Uuid, admin_id: i64) -> Result<bool> {
-        let result = sqlx::query(
-            "UPDATE pending_uploads SET status = 'cancelled' WHERE id = $1 AND uploaded_by = $2 AND status = 'pending'",
+    pub async fn cancel_upload(&self, id: Uuid, admin_id: i64) -> Result<(bool, Option<String>)> {
+        let key = sqlx::query_scalar::<_, Option<String>>(
+            "UPDATE pending_uploads SET status = 'cancelled' WHERE id = $1 AND uploaded_by = $2 AND status = 'pending' RETURNING source_object_key",
         )
         .bind(id)
         .bind(admin_id)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        Ok(match key {
+            Some(key) => (true, key),
+            None => (false, None),
+        })
     }
 
     pub async fn confirm_upload(&self, id: Uuid, admin_id: i64) -> Result<Publication> {
@@ -537,7 +586,7 @@ impl Store {
         }
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT week_start, week_end, update_kind, base_version, diff, parsed_lessons, file_name, file_sha256 \
+            "SELECT week_start, week_end, update_kind, base_version, diff, parsed_lessons, file_name, file_sha256, source_object_key \
              FROM pending_uploads WHERE id = $1 AND uploaded_by = $2 AND status = 'pending' FOR UPDATE",
         )
         .bind(id)
@@ -568,8 +617,8 @@ impl Store {
         .await?;
         let version_id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO schedule_versions (id, week_start, week_end, revision, update_kind, file_name, file_sha256, created_by) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO schedule_versions (id, week_start, week_end, revision, update_kind, file_name, file_sha256, created_by, source_object_key) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(version_id)
         .bind(week_start)
@@ -579,6 +628,7 @@ impl Store {
         .bind(row.try_get::<String, _>("file_name")?)
         .bind(row.try_get::<String, _>("file_sha256")?)
         .bind(admin_id)
+        .bind(row.try_get::<Option<String>, _>("source_object_key")?)
         .execute(&mut *tx)
         .await?;
         insert_lessons(&mut tx, version_id, &parsed_lessons.0).await?;
@@ -611,7 +661,7 @@ impl Store {
             diff.0.changed_groups.clone()
         };
         let recipients = sqlx::query_scalar::<_, i64>(
-            "SELECT telegram_id FROM users WHERE group_code = ANY($1)",
+            "SELECT telegram_id FROM users WHERE group_code = ANY($1) AND daily_notifications_enabled",
         )
         .bind(&notify_groups)
         .fetch_all(&mut *tx)
@@ -682,6 +732,7 @@ struct UserRow {
     pending_group: Option<String>,
     flow_state: String,
     search_kind: Option<String>,
+    daily_notifications_enabled: bool,
 }
 
 impl From<UserRow> for User {
@@ -694,6 +745,7 @@ impl From<UserRow> for User {
             pending_group: row.pending_group,
             flow_state: row.flow_state,
             search_kind: row.search_kind,
+            daily_notifications_enabled: row.daily_notifications_enabled,
         }
     }
 }

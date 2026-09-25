@@ -1,9 +1,12 @@
+pub mod archive;
 pub mod domain;
 pub mod format;
 pub mod handlers;
+pub mod metrics;
 pub mod rate_limit;
 pub mod store;
 
+use archive::SourceArchive;
 use chrono::{NaiveDate, Utc};
 use chrono_tz::Tz;
 use rate_limit::RateLimiter;
@@ -16,6 +19,7 @@ pub struct AppState {
     pub timezone: Tz,
     pub bot_username: String,
     pub rate_limiter: RateLimiter,
+    pub archive: SourceArchive,
 }
 
 impl AppState {

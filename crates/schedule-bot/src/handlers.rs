@@ -36,8 +36,9 @@ async fn handle_message(bot: Bot, message: Message, state: AppState) -> HandlerR
     let chat_id = message.chat.id.0;
     match &message.chat.kind {
         ChatKind::Private(_) => {
-            if !state.rate_limiter.allow(user_id, chat_id) {
-                if state.rate_limiter.should_warn(user_id) {
+            if !state.rate_limiter.allow(user_id, chat_id).await? {
+                crate::metrics::RATE_LIMITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if state.rate_limiter.should_warn(user_id).await? {
                     send_text(
                         &bot,
                         message.chat.id,
@@ -85,6 +86,30 @@ async fn handle_private_message(
         }
         if text.starts_with("/admin_link") {
             handle_admin_link(&bot, message.chat.id, &state, user_id).await?;
+            return Ok(());
+        }
+        if text.starts_with("/notifications") || text == "🔔 Уведомления" {
+            let user = state
+                .store
+                .user(user_id)
+                .await?
+                .ok_or_else(|| anyhow!("пользователь не найден"))?;
+            let enabled = !user.daily_notifications_enabled;
+            state
+                .store
+                .set_daily_notifications(user_id, enabled)
+                .await?;
+            let status = if enabled {
+                "включены"
+            } else {
+                "выключены"
+            };
+            send_menu(
+                &bot,
+                message.chat.id,
+                &format!("Ежедневные уведомления {status}."),
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -170,11 +195,30 @@ async fn handle_group_message(
         return Ok(());
     };
     let chat_id = message.chat.id;
-    if !state.rate_limiter.allow(user_id, chat_id.0) {
+    if !state.rate_limiter.allow(user_id, chat_id.0).await? {
+        crate::metrics::RATE_LIMITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(());
     }
 
     match command.as_str() {
+        "disable" => {
+            let member = match bot.get_chat_member(chat_id, UserId(user_id as u64)).await {
+                Ok(member) => member,
+                Err(_) => {
+                    send_text(&bot, chat_id, "Не удалось проверить права администратора чата.").await?;
+                    return Ok(());
+                }
+            };
+            if !matches!(member.kind, ChatMemberKind::Owner(_) | ChatMemberKind::Administrator(_)) {
+                send_text(&bot, chat_id, "Отключить расписание могут только администраторы чата.").await?;
+                return Ok(());
+            }
+            if state.store.remove_chat_group(chat_id.0).await? {
+                send_text(&bot, chat_id, "✅ Команды расписания отключены для этого чата. Чтобы включить снова, администратор может вызвать /setgroup ИС11В.").await?;
+            } else {
+                send_text(&bot, chat_id, "Для этого чата расписание уже не настроено.").await?;
+            }
+        }
         "setgroup" => {
             let member = match bot.get_chat_member(chat_id, UserId(user_id as u64)).await {
                 Ok(member) => member,
@@ -285,7 +329,7 @@ fn single_argument(args: &[String]) -> Option<&str> {
 }
 
 fn group_help_text() -> &'static str {
-    "Команды расписания в группе:\n/setgroup ИС11В — привязать группу (только администратор чата)\n/group — показать выбранную группу\n/today — расписание на сегодня\n/week — расписание на неделю\n/day 28.09.2026 — расписание на дату"
+    "Команды расписания в группе:\n/setgroup ИС11В — привязать группу (только администратор чата)\n/disable — отключить расписание (только администратор чата)\n/group — показать выбранную группу\n/today — расписание на сегодня\n/week — расписание на неделю\n/day 28.09.2026 — расписание на дату"
 }
 
 async fn handle_start(
@@ -376,9 +420,10 @@ async fn handle_group_input(
 async fn handle_callback(bot: Bot, query: CallbackQuery, state: AppState) -> HandlerResult {
     let user_id = query.from.id.0 as i64;
     let chat_id = ChatId(user_id);
-    if !state.rate_limiter.allow(user_id, chat_id.0) {
+    if !state.rate_limiter.allow(user_id, chat_id.0).await? {
+        crate::metrics::RATE_LIMITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         bot.answer_callback_query(query.id.clone()).await?;
-        if state.rate_limiter.should_warn(user_id) {
+        if state.rate_limiter.should_warn(user_id).await? {
             send_text(
                 &bot,
                 chat_id,
@@ -459,7 +504,13 @@ async fn handle_callback(bot: Bot, query: CallbackQuery, state: AppState) -> Han
         }
         _ if data.starts_with("upload:cancel:") => {
             let id = Uuid::parse_str(data.trim_start_matches("upload:cancel:"))?;
-            if state.store.cancel_upload(id, user_id).await? {
+            let (cancelled, source_key) = state.store.cancel_upload(id, user_id).await?;
+            if cancelled {
+                if let Some(key) = source_key {
+                    if let Err(error) = state.archive.delete(&key).await {
+                        tracing::warn!(%error, %key, "не удалось удалить отменённую исходную таблицу из S3");
+                    }
+                }
                 send_text(
                     &bot,
                     chat_id,
@@ -708,6 +759,36 @@ async fn handle_document(
         .await
     {
         Ok(preview) => {
+            let key = match state.archive.save(preview.id, &extension, &bytes).await {
+                Ok(key) => key,
+                Err(error) => {
+                    state.store.cancel_upload(preview.id, user_id).await?;
+                    send_text(
+                        bot,
+                        message.chat.id,
+                        &format!("Не удалось сохранить исходную таблицу в архиве: {error}"),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            if let Err(error) = state
+                .store
+                .attach_source_key(preview.id, user_id, &key)
+                .await
+            {
+                state.store.cancel_upload(preview.id, user_id).await?;
+                if let Err(delete_error) = state.archive.delete(&key).await {
+                    tracing::warn!(%delete_error, "не удалось удалить неиспользуемый Excel из S3");
+                }
+                send_text(
+                    bot,
+                    message.chat.id,
+                    &format!("Не удалось подготовить исходную таблицу к публикации: {error}"),
+                )
+                .await?;
+                return Ok(());
+            }
             let summary = preview_message(&preview);
             let keyboard = InlineKeyboardMarkup::new(vec![vec![
                 InlineKeyboardButton::callback(
@@ -809,6 +890,7 @@ async fn send_menu(bot: &Bot, chat_id: ChatId, text: &str) -> Result<()> {
             KeyboardButton::new("🗓️ На неделю"),
         ],
         vec![KeyboardButton::new("🔎 Расширенный поиск")],
+        vec![KeyboardButton::new("🔔 Уведомления")],
     ])
     .resize_keyboard();
     bot.send_message(chat_id, text)
@@ -886,7 +968,7 @@ fn publication_message(publication: &crate::store::Publication) -> String {
 }
 
 fn help_text() -> &'static str {
-    "Команды и меню:\n/start — начать или открыть меню\n/admin_link — создать одноразовую ссылку администратора\n\nДля студентов доступны расписание на сегодня, на неделю и поиск по преподавателю или аудитории. В группах: /setgroup, /today, /week, /day."
+    "Команды и меню:\n/start — начать или открыть меню\n/notifications — переключить ежедневные уведомления\n/admin_link — создать одноразовую ссылку администратора\n\nДля студентов доступны расписание на сегодня, на неделю и поиск по преподавателю или аудитории. В группах: /setgroup, /disable, /today, /week, /day."
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
