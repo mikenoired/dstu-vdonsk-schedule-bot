@@ -1,0 +1,7 @@
+.git
+target
+.DS_Store
+.env*
+*.jpg
+*.jpeg
+week.json

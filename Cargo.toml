@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/schedule-parser", "crates/schedule-cli", "crates/schedule-bot"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+calamine = "0.36"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

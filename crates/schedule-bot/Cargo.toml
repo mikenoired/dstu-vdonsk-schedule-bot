@@ -1,0 +1,26 @@
+[package]
+name = "schedule-bot"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1"
+chrono.workspace = true
+chrono-tz = "0.10"
+dotenvy = "0.15"
+dptree = "0.5"
+hex = "0.4"
+schedule-parser = { path = "../schedule-parser" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "migrate", "macros"] }
+subtle = "2"
+teloxide = { version = "0.17", features = ["macros", "ctrlc_handler"] }
+thiserror.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }

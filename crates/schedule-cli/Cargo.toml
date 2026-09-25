@@ -1,0 +1,20 @@
+[package]
+name = "schedule-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "schedule"
+path = "src/main.rs"
+
+[dependencies]
+ab_glyph = "0.2"
+anyhow = "1"
+chrono.workspace = true
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+imageproc = { version = "0.27", default-features = false, features = ["text"] }
+schedule-parser = { path = "../schedule-parser" }
+serde_json.workspace = true
