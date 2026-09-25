@@ -97,9 +97,10 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Vec<Lesson>, ParseError> {
                     .map(|room| display_room_name(&room));
                 let (subject, lesson_type, teacher) = parse_description(&description);
 
-                // Room cells repeat down merged multi-period lessons. The subject is
-                // only present in the first row, so extend that entry through them.
-                let mut end_time = time.1.clone();
+                // Excel can merge a subject cell vertically across several pair rows.
+                // Keep a separate lesson for each row and carry the merged subject
+                // metadata to those rows instead of joining their time ranges.
+                let mut periods = vec![(lesson_number, time.0.clone(), time.1.clone())];
                 let mut next_index = row_index + 1;
                 while next_index < rows.len() {
                     let next = &rows[next_index];
@@ -108,6 +109,16 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Vec<Lesson>, ParseError> {
                     {
                         break;
                     }
+                    let Some(next_time) = next.get(3).and_then(|v| parse_time(v)) else {
+                        break;
+                    };
+                    let Some(next_number) = next
+                        .get(2)
+                        .and_then(|v| v.parse::<u8>().ok())
+                        .filter(|number| *number > 0)
+                    else {
+                        break;
+                    };
                     let next_room = next
                         .get(subject_col + 1)
                         .and_then(|v| non_empty(v))
@@ -119,25 +130,25 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Vec<Lesson>, ParseError> {
                     {
                         break;
                     }
-                    if let Some((_, next_end)) = next.get(3).and_then(|v| parse_time(v)) {
-                        end_time = next_end;
-                    }
+                    periods.push((next_number, next_time.0, next_time.1));
                     next_index += 1;
                 }
 
-                lessons.push(Lesson {
-                    groups: group_names.clone(),
-                    date,
-                    weekday: day_name.clone(),
-                    lesson_number,
-                    start_time: time.0.clone(),
-                    end_time,
-                    subject,
-                    lesson_type,
-                    teacher,
-                    room,
-                    description,
-                });
+                for (period_number, start_time, end_time) in periods {
+                    lessons.push(Lesson {
+                        groups: group_names.clone(),
+                        date,
+                        weekday: day_name.clone(),
+                        lesson_number: period_number,
+                        start_time,
+                        end_time,
+                        subject: subject.clone(),
+                        lesson_type: lesson_type.clone(),
+                        teacher: teacher.clone(),
+                        room: room.clone(),
+                        description: description.clone(),
+                    });
+                }
             }
         }
     }
