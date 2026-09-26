@@ -349,7 +349,6 @@ fn single_argument(args: &[String]) -> Option<&str> {
 
 fn parse_user_date(value: &str) -> Option<NaiveDate> {
     ["%d.%m.%Y", "%d.%m.%y"].iter().find_map(|format| {
-        // `%d.%m.%Y` безошибочно съедает двухзначный год, отсюда 28.09.0026.
         NaiveDate::parse_from_str(value, format)
             .ok()
             .filter(|date| date.year() >= 1000)
