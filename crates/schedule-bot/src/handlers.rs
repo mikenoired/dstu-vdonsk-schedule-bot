@@ -2,7 +2,7 @@ use crate::AppState;
 use crate::format::format_schedule;
 use crate::stats::{self, Period};
 use anyhow::{Context, Result, anyhow};
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use schedule_parser::Lesson;
 use std::{error::Error, path::PathBuf};
 use subtle::ConstantTimeEq;
@@ -292,9 +292,7 @@ async fn handle_group_message(
                 return Ok(());
             };
             let date = if command == "day" {
-                let Some(date) = single_argument(&args)
-                    .and_then(|value| NaiveDate::parse_from_str(value, "%d.%m.%Y").ok())
-                else {
+                let Some(date) = single_argument(&args).and_then(parse_user_date) else {
                     send_text(&bot, chat_id, "Использование: /day 28.09.2026").await?;
                     return Ok(());
                 };
@@ -347,6 +345,14 @@ fn parse_group_command(text: &str, bot_username: &str) -> Option<(String, Vec<St
 
 fn single_argument(args: &[String]) -> Option<&str> {
     (args.len() == 1).then(|| args[0].as_str())
+}
+
+fn parse_user_date(value: &str) -> Option<NaiveDate> {
+    ["%d.%m.%Y", "%d.%m.%y"].iter().find_map(|format| {
+        NaiveDate::parse_from_str(value, format)
+            .ok()
+            .filter(|date| date.year() >= 1000)
+    })
 }
 
 fn group_help_text() -> &'static str {
@@ -1138,7 +1144,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_group_command, stats_callback_allowed};
+    use super::{parse_group_command, parse_user_date, stats_callback_allowed};
+    use chrono::NaiveDate;
 
     #[test]
     fn parses_group_command_and_arguments() {
@@ -1159,6 +1166,20 @@ mod tests {
             parse_group_command("/week", "schedulebot"),
             Some(("week".to_owned(), vec![]))
         );
+    }
+
+    #[test]
+    fn parses_day_argument_with_and_without_four_digit_year() {
+        assert_eq!(
+            parse_user_date("28.9.26"),
+            NaiveDate::from_ymd_opt(2026, 9, 28)
+        );
+        assert_eq!(
+            parse_user_date("28.09.2026"),
+            NaiveDate::from_ymd_opt(2026, 9, 28)
+        );
+        assert_eq!(parse_user_date("28.09"), None);
+        assert_eq!(parse_user_date("завтра"), None);
     }
 
     #[test]
