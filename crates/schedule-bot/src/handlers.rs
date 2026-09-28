@@ -9,7 +9,7 @@ use subtle::ConstantTimeEq;
 use teloxide::{
     dispatching::UpdateHandler,
     net::Download,
-    payloads::SendMessageSetters,
+    payloads::{EditMessageTextSetters, SendMessageSetters},
     prelude::*,
     requests::Requester,
     types::{
@@ -491,6 +491,10 @@ async fn handle_callback(bot: Bot, query: CallbackQuery, state: AppState) -> Han
         edit_stats_dashboard(&bot, chat_id, message_id, &state, period).await?;
         return Ok(());
     }
+    if data.starts_with("nav:day:") || data.starts_with("nav:week:") {
+        handle_schedule_navigation(&bot, &query, &state, user_id, &data).await?;
+        return Ok(());
+    }
     bot.answer_callback_query(query.id.clone()).await?;
     record_metric(&state, stats::Metric::Commands, 1).await;
     state
@@ -745,28 +749,7 @@ async fn show_today(
         .await?;
         return Ok(());
     };
-    let today = state.today();
-    let lessons = state.store.today_lessons(group, today).await?;
-    if lessons.is_empty() {
-        send_menu(
-            bot,
-            chat_id,
-            &format!(
-                "На сегодня ({}) занятий не нашёл.",
-                today.format("%d.%m.%Y")
-            ),
-        )
-        .await?;
-    } else {
-        send_schedule(
-            bot,
-            chat_id,
-            &format!("Сегодня · группа {group}"),
-            &lessons,
-            false,
-        )
-        .await?;
-    }
+    show_day(bot, chat_id, state, group, state.today(), None).await?;
     Ok(())
 }
 
@@ -789,25 +772,186 @@ async fn show_week(
         .await?;
         return Ok(());
     };
-    let lessons = state.store.week_lessons(group, state.today()).await?;
-    if lessons.is_empty() {
-        send_menu(
-            bot,
-            chat_id,
-            "Для этой группы пока нет опубликованного расписания.",
-        )
-        .await?;
+    let week_start = current_week_start(state.today());
+    show_week_at(bot, chat_id, state, group, week_start, None).await?;
+    Ok(())
+}
+
+async fn show_day(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &AppState,
+    group: &str,
+    date: NaiveDate,
+    message_id: Option<teloxide::types::MessageId>,
+) -> Result<()> {
+    let lessons = state.store.today_lessons(group, date).await?;
+    let heading = format!("📅 {} · группа {group}", date.format("%d.%m.%Y"));
+    let text = if lessons.is_empty() {
+        format!("{heading}\n\n📭 По опубликованному расписанию занятий нет.")
     } else {
-        send_schedule(
-            bot,
-            chat_id,
-            &format!("На неделю · группа {group}"),
-            &lessons,
-            true,
-        )
-        .await?;
+        format_schedule(&heading, &lessons, false)
+    };
+    let keyboard = day_navigation_keyboard(date);
+    if let Some(message_id) = message_id {
+        bot.edit_message_text(chat_id, message_id, text)
+            .reply_markup(keyboard)
+            .await?;
+    } else {
+        bot.send_message(chat_id, text).reply_markup(keyboard).await?;
     }
     Ok(())
+}
+
+async fn show_week_at(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &AppState,
+    group: &str,
+    week_start: NaiveDate,
+    message_id: Option<teloxide::types::MessageId>,
+) -> Result<()> {
+    let week_end = week_start + chrono::Duration::days(6);
+    let lessons = state
+        .store
+        .week_lessons_for_start(group, week_start)
+        .await?;
+    let heading = format!(
+        "🗓️ Неделя {}–{} · группа {group}",
+        week_start.format("%d.%m.%Y"),
+        week_end.format("%d.%m.%Y")
+    );
+    let text = if lessons.is_empty() {
+        format!("{heading}\n\n📭 Для этой недели расписание не опубликовано.")
+    } else {
+        format_schedule(&heading, &lessons, true)
+    };
+    let keyboard = week_navigation_keyboard(week_start);
+    if let Some(message_id) = message_id {
+        bot.edit_message_text(chat_id, message_id, text)
+            .reply_markup(keyboard)
+            .await?;
+    } else {
+        bot.send_message(chat_id, text).reply_markup(keyboard).await?;
+    }
+    Ok(())
+}
+
+async fn handle_schedule_navigation(
+    bot: &Bot,
+    query: &CallbackQuery,
+    state: &AppState,
+    user_id: i64,
+    data: &str,
+) -> Result<()> {
+    let message = query
+        .message
+        .as_ref()
+        .and_then(|message| message.regular_message());
+    let Some(message) = message.filter(|message| {
+        message.chat.id.0 == user_id && matches!(&message.chat.kind, ChatKind::Private(_))
+    }) else {
+        bot.answer_callback_query(query.id.clone())
+            .text("Навигация доступна в личном чате с ботом.")
+            .await?;
+        return Ok(());
+    };
+    let Some(user) = state.store.user(user_id).await? else {
+        bot.answer_callback_query(query.id.clone()).await?;
+        return Ok(());
+    };
+    let Some(group) = user.group_code.as_deref() else {
+        bot.answer_callback_query(query.id.clone()).await?;
+        return Ok(());
+    };
+    bot.answer_callback_query(query.id.clone()).await?;
+    let payload = data.split(':').skip(2).collect::<Vec<_>>();
+    match payload.as_slice() {
+        [date] if data.starts_with("nav:day:") => {
+            let Some(date) = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok() else {
+                return Ok(());
+            };
+            show_day(bot, message.chat.id, state, group, date, Some(message.id)).await?;
+        }
+        [action, date] if data.starts_with("nav:week:") => {
+            let Some(mut week_start) = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok() else {
+                return Ok(());
+            };
+            match *action {
+                "prev" => week_start -= chrono::Duration::days(7),
+                "next" => week_start += chrono::Duration::days(7),
+                "current" => {
+                    let current = current_week_start(state.today());
+                    if week_start == current {
+                        return Ok(());
+                    }
+                    week_start = current;
+                }
+                "exit" => {
+                    bot.edit_message_reply_markup(message.chat.id, message.id)
+                        .await?;
+                    send_menu(bot, message.chat.id, "Режим просмотра недель закрыт.").await?;
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            }
+            show_week_at(
+                bot,
+                message.chat.id,
+                state,
+                group,
+                week_start,
+                Some(message.id),
+            )
+            .await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn current_week_start(today: NaiveDate) -> NaiveDate {
+    let monday = today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
+    if today.weekday() == chrono::Weekday::Sun {
+        monday + chrono::Duration::days(7)
+    } else {
+        monday
+    }
+}
+
+fn day_navigation_keyboard(date: NaiveDate) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback(
+            "⬅️ Предыдущий день",
+            format!("nav:day:{}", date - chrono::Duration::days(1)),
+        ),
+        InlineKeyboardButton::callback(
+            "Следующий день ➡️",
+            format!("nav:day:{}", date + chrono::Duration::days(1)),
+        ),
+    ]])
+}
+
+fn week_navigation_keyboard(week_start: NaiveDate) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback(
+                "⬅️ Предыдущая",
+                format!("nav:week:prev:{week_start}"),
+            ),
+            InlineKeyboardButton::callback(
+                "Следующая ➡️",
+                format!("nav:week:next:{week_start}"),
+            ),
+        ],
+        vec![
+            InlineKeyboardButton::callback(
+                "📍 Текущая неделя",
+                format!("nav:week:current:{week_start}"),
+            ),
+            InlineKeyboardButton::callback("✖️ Выйти", format!("nav:week:exit:{week_start}")),
+        ],
+    ])
 }
 
 async fn handle_admin_link(

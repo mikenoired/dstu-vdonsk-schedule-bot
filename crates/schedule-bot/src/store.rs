@@ -421,6 +421,26 @@ impl Store {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    pub async fn week_lessons_for_start(
+        &self,
+        group: &str,
+        week_start: NaiveDate,
+    ) -> Result<Vec<Lesson>> {
+        let rows = sqlx::query_as::<_, DbLesson>(
+            "SELECT l.groups, l.lesson_date, l.weekday, l.lesson_number, l.start_time, l.end_time, \
+             l.subject, l.lesson_type, l.teacher, l.room, l.description \
+             FROM lessons l JOIN schedule_weeks w ON w.current_version = l.version_id \
+             WHERE w.week_start = $2 AND $1 = ANY(l.groups) \
+               AND l.lesson_date >= $2 AND l.lesson_date < $2 + 7 \
+             ORDER BY l.lesson_date, l.start_time, l.lesson_number",
+        )
+        .bind(group)
+        .bind(week_start)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     pub async fn search_lessons(
         &self,
         kind: &str,
