@@ -414,7 +414,7 @@ impl Store {
         state: &str,
         search_kind: Option<&str>,
     ) -> Result<()> {
-        sqlx::query("UPDATE users SET flow_state = $2, search_kind = $3, updated_at = now() WHERE telegram_id = $1")
+        sqlx::query("UPDATE users SET flow_state = $2, search_kind = $3, pending_group = NULL, updated_at = now() WHERE telegram_id = $1")
             .bind(telegram_id)
             .bind(state)
             .bind(search_kind)

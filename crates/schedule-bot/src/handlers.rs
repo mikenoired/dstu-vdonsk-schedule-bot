@@ -119,17 +119,27 @@ async fn handle_private_message(
                 .store
                 .set_daily_notifications(user_id, enabled)
                 .await?;
+            state.store.set_flow_state(user_id, "menu", None).await?;
             let status = if enabled {
                 "включены"
             } else {
                 "выключены"
             };
-            send_menu(
-                &bot,
-                message.chat.id,
-                &format!("Ежедневные уведомления {status}."),
-            )
-            .await?;
+            if text == "🔔 Уведомления" {
+                send_additional_menu(
+                    &bot,
+                    message.chat.id,
+                    &format!("Ежедневные уведомления {status}."),
+                )
+                .await?;
+            } else {
+                send_menu(
+                    &bot,
+                    message.chat.id,
+                    &format!("Ежедневные уведомления {status}."),
+                )
+                .await?;
+            }
             return Ok(());
         }
     }
@@ -152,6 +162,25 @@ async fn handle_private_message(
         .await?;
         return Ok(());
     };
+
+    if is_additional_button(text) {
+        state.store.set_flow_state(user_id, "menu", None).await?;
+        send_additional_menu(&bot, message.chat.id, "Дополнительные настройки.").await?;
+        return Ok(());
+    }
+    if is_back_button(text) {
+        state.store.set_flow_state(user_id, "menu", None).await?;
+        send_menu(&bot, message.chat.id, "Главное меню.").await?;
+        return Ok(());
+    }
+    if is_change_group_button(text) {
+        state
+            .store
+            .set_flow_state(user_id, "await_group", None)
+            .await?;
+        send_text(&bot, message.chat.id, "Напиши свою учебную группу.").await?;
+        return Ok(());
+    }
 
     match user.flow_state.as_str() {
         "await_group" => handle_group_input(&bot, message.chat.id, &state, user_id, text).await?,
@@ -431,15 +460,11 @@ async fn handle_group_input(
     input: &str,
 ) -> Result<()> {
     let groups = state.store.known_groups().await?;
-    let input = input.trim();
-    let found = groups
-        .into_iter()
-        .find(|group| group.to_lowercase() == input.to_lowercase());
-    if let Some(group) = found {
-        state.store.set_pending_group(user_id, &group).await?;
-        send_group_confirmation(bot, chat_id, &group).await?;
+    let suggestions = suggest_groups(input, &groups);
+    if !suggestions.is_empty() {
+        send_group_suggestions(bot, chat_id, &suggestions).await?;
     } else {
-        send_text(bot, chat_id, "Не нашёл такую группу в опубликованных расписаниях. Проверь написание и попробуй ещё раз.").await?;
+        send_text(bot, chat_id, "Не нашёл похожих групп в опубликованных расписаниях. Проверь написание и попробуй ещё раз.").await?;
     }
     Ok(())
 }
@@ -503,6 +528,24 @@ async fn handle_callback(bot: Bot, query: CallbackQuery, state: AppState) -> Han
         .await?;
 
     match data.as_str() {
+        _ if data.starts_with("group:pick:") => {
+            let selected = data.trim_start_matches("group:pick:");
+            let user = state.store.user(user_id).await?;
+            let known_groups = state.store.known_groups().await?;
+            if user.is_some_and(|user| user.flow_state == "await_group")
+                && known_groups.iter().any(|group| group == selected)
+            {
+                state.store.set_pending_group(user_id, selected).await?;
+                send_group_confirmation(&bot, chat_id, selected).await?;
+            } else {
+                send_text(
+                    &bot,
+                    chat_id,
+                    "Этот выбор группы уже устарел. Напиши группу ещё раз.",
+                )
+                .await?;
+            }
+        }
         "group:yes" => {
             if let Some(group) = state.store.confirm_group(user_id).await? {
                 send_menu(&bot, chat_id, &format!("Группа {group} сохранена.")).await?;
@@ -1133,6 +1176,24 @@ async fn send_group_confirmation(bot: &Bot, chat_id: ChatId, group: &str) -> Res
     Ok(())
 }
 
+async fn send_group_suggestions(bot: &Bot, chat_id: ChatId, groups: &[String]) -> Result<()> {
+    let keyboard = InlineKeyboardMarkup::new(
+        groups
+            .iter()
+            .map(|group| {
+                vec![InlineKeyboardButton::callback(
+                    group.clone(),
+                    format!("group:pick:{group}"),
+                )]
+            })
+            .collect::<Vec<_>>(),
+    );
+    bot.send_message(chat_id, "Выбери свою группу:")
+        .reply_markup(keyboard)
+        .await?;
+    Ok(())
+}
+
 async fn show_search_keyboard(bot: &Bot, chat_id: ChatId) -> Result<()> {
     let keyboard = InlineKeyboardMarkup::new(vec![
         vec![InlineKeyboardButton::callback(
@@ -1199,7 +1260,22 @@ async fn send_menu(bot: &Bot, chat_id: ChatId, text: &str) -> Result<()> {
             KeyboardButton::new("🗓️ На неделю"),
         ],
         vec![KeyboardButton::new("🔎 Расширенный поиск")],
-        vec![KeyboardButton::new("🔔 Уведомления")],
+        vec![KeyboardButton::new("⚙️ Дополнительно")],
+    ])
+    .resize_keyboard();
+    bot.send_message(chat_id, text)
+        .reply_markup(keyboard)
+        .await?;
+    Ok(())
+}
+
+async fn send_additional_menu(bot: &Bot, chat_id: ChatId, text: &str) -> Result<()> {
+    let keyboard = KeyboardMarkup::new(vec![
+        vec![
+            KeyboardButton::new("🔔 Уведомления"),
+            KeyboardButton::new("👥 Сменить группу"),
+        ],
+        vec![KeyboardButton::new("⬅️ Назад")],
     ])
     .resize_keyboard();
     bot.send_message(chat_id, text)
@@ -1219,6 +1295,84 @@ fn is_today_button(text: &str) -> bool {
 fn is_week_button(text: &str) -> bool {
     text == "На неделю" || text == "🗓️ На неделю"
 }
+fn is_additional_button(text: &str) -> bool {
+    text == "Дополнительно" || text == "⚙️ Дополнительно"
+}
+fn is_change_group_button(text: &str) -> bool {
+    text == "Сменить группу" || text == "👥 Сменить группу"
+}
+fn is_back_button(text: &str) -> bool {
+    text == "Назад" || text == "⬅️ Назад"
+}
+
+fn suggest_groups(input: &str, groups: &[String]) -> Vec<String> {
+    let normalized_input = normalize_group(input);
+    if normalized_input.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranked = groups
+        .iter()
+        .filter_map(|group| {
+            let callback_data = format!("group:pick:{group}");
+            if callback_data.len() > 64 {
+                return None;
+            }
+            let distance = group_distance(&normalized_input, &normalize_group(group));
+            (distance <= 1).then(|| (distance, group.clone()))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(
+        |(left_distance, left_group), (right_distance, right_group)| {
+            left_distance
+                .cmp(right_distance)
+                .then_with(|| left_group.cmp(right_group))
+        },
+    );
+    ranked.dedup_by(|left, right| left.1 == right.1);
+    ranked.into_iter().take(7).map(|(_, group)| group).collect()
+}
+
+fn normalize_group(group: &str) -> String {
+    group
+        .chars()
+        .flat_map(char::to_uppercase)
+        .filter(|character| !character.is_whitespace() && !matches!(*character, '-' | '_' | '–'))
+        .map(|character| match character {
+            'A' => 'А',
+            'B' => 'В',
+            'C' => 'С',
+            'E' => 'Е',
+            'H' => 'Н',
+            'K' => 'К',
+            'M' => 'М',
+            'O' => 'О',
+            'P' => 'Р',
+            'T' => 'Т',
+            'X' => 'Х',
+            other => other,
+        })
+        .collect()
+}
+
+fn group_distance(left: &str, right: &str) -> usize {
+    let right_chars = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right_chars.len() + 1];
+
+    for (left_index, left_char) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            let substitution_cost = if left_char == *right_char { 0 } else { 1 };
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + substitution_cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right_chars.len()]
+}
+
 fn is_search_button(text: &str) -> bool {
     text == "Расширенный поиск" || text == "🔎 Расширенный поиск"
 }
@@ -1277,7 +1431,7 @@ fn publication_message(publication: &crate::store::Publication) -> String {
 }
 
 fn help_text() -> &'static str {
-    "Команды и меню:\n/start — начать или открыть меню\n/notifications — переключить ежедневные уведомления\n/admin_link — создать одноразовую ссылку администратора\n\nДля студентов доступны расписание на сегодня, на неделю и поиск по преподавателю или аудитории. В группах: /setgroup, /disable, /today, /week, /day."
+    "Команды и меню:\n/start — начать или открыть меню\n/notifications — переключить ежедневные уведомления\n/admin_link — создать одноразовую ссылку администратора\n\nДля студентов доступны расписание на сегодня, на неделю и поиск по преподавателю или аудитории. Смена группы и уведомления — в разделе «Дополнительно». В группах: /setgroup, /disable, /today, /week, /day."
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
