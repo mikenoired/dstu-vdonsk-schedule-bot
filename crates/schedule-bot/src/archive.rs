@@ -44,6 +44,7 @@ impl SourceArchive {
                 anyhow::bail!("неизвестный S3 URL style `{other}`; ожидается `virtual` или `path`")
             }
         };
+        let endpoint = endpoint_for_style(&endpoint, &bucket, virtual_hosted)?;
         let store = AmazonS3Builder::new()
             .with_bucket_name(bucket)
             .with_region(region)
@@ -81,4 +82,57 @@ fn env_any(names: &[&str]) -> Option<String> {
             .ok()
             .filter(|value| !value.trim().is_empty())
     })
+}
+
+fn endpoint_for_style(endpoint: &str, bucket: &str, virtual_hosted: bool) -> Result<String> {
+    if !virtual_hosted {
+        return Ok(endpoint.to_owned());
+    }
+
+    // Railway exposes the base endpoint (for example, https://t3.storageapi.dev),
+    // while object_store expects the bucket hostname for virtual-hosted requests.
+    let mut url = reqwest::Url::parse(endpoint).context("некорректный S3 endpoint URL")?;
+    let host = url
+        .host_str()
+        .context("в S3 endpoint отсутствует hostname")?;
+    if host == bucket || host.starts_with(&format!("{bucket}.")) {
+        return Ok(endpoint.to_owned());
+    }
+    url.set_host(Some(&format!("{bucket}.{host}")))
+        .map_err(|_| anyhow::anyhow!("не удалось добавить имя бакета к S3 endpoint"))?;
+    Ok(url.to_string().trim_end_matches('/').to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_for_style;
+
+    #[test]
+    fn adds_bucket_subdomain_to_railway_virtual_host_endpoint() {
+        assert_eq!(
+            endpoint_for_style("https://t3.storageapi.dev", "schedule-abc123", true).unwrap(),
+            "https://schedule-abc123.t3.storageapi.dev"
+        );
+    }
+
+    #[test]
+    fn does_not_duplicate_bucket_subdomain() {
+        assert_eq!(
+            endpoint_for_style(
+                "https://schedule-abc123.t3.storageapi.dev",
+                "schedule-abc123",
+                true
+            )
+            .unwrap(),
+            "https://schedule-abc123.t3.storageapi.dev"
+        );
+    }
+
+    #[test]
+    fn leaves_path_style_endpoint_unchanged() {
+        assert_eq!(
+            endpoint_for_style("https://t3.storageapi.dev", "schedule-abc123", false).unwrap(),
+            "https://t3.storageapi.dev"
+        );
+    }
 }

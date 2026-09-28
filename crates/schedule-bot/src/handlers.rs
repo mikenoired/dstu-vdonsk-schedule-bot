@@ -928,6 +928,7 @@ async fn handle_document(
             let key = match archive.save(preview.id, &extension, &bytes).await {
                 Ok(key) => key,
                 Err(error) => {
+                    tracing::error!(error = %format!("{error:#}"), "не удалось архивировать исходный Excel в S3");
                     state.store.cancel_upload(preview.id, user_id).await?;
                     send_text(
                         bot,
