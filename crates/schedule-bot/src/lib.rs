@@ -6,6 +6,7 @@ pub mod metrics;
 pub mod rate_limit;
 pub mod stats;
 pub mod store;
+pub mod website_schedule;
 
 use archive::SourceArchive;
 use chrono::{NaiveDate, Utc};

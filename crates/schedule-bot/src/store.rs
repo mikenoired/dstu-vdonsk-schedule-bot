@@ -1,7 +1,8 @@
 use crate::domain::{ScheduleDiff, UpdateKind, compare_schedules, validate_schedule};
 use crate::format::{DailyKind, format_daily_delivery};
+use crate::website_schedule::{WebsiteWeek, WeekChange, classify_week_change};
 use anyhow::{Context, Result, bail};
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use schedule_parser::{Lesson, display_room_name};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions, types::Json};
@@ -42,6 +43,16 @@ pub struct Publication {
     pub week_end: NaiveDate,
     pub kind: UpdateKind,
     pub diff: ScheduleDiff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteReminderOutcome {
+    BaselineStored,
+    SemesterBaselineStored,
+    Unchanged,
+    ScheduleAlreadyPublished,
+    AlreadyReminded,
+    ReminderQueued,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -100,6 +111,130 @@ impl Store {
         )
         .fetch_one(&self.pool)
         .await?)
+    }
+
+    pub async fn claim_schedule_site_check(&self, slot_start: DateTime<Utc>) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM schedule_site_check_slots WHERE slot_start < now() - interval '30 days'",
+        )
+        .execute(&mut *tx)
+        .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO schedule_site_check_slots (slot_start) VALUES ($1) \
+             ON CONFLICT (slot_start) DO NOTHING",
+        )
+        .bind(slot_start)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    pub async fn observe_site_week(
+        &self,
+        week: &WebsiteWeek,
+        target_week_start: NaiveDate,
+    ) -> Result<SiteReminderOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let previous = sqlx::query(
+            "SELECT semester_key, academic_week FROM schedule_site_state WHERE singleton = TRUE FOR UPDATE",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let previous_key = previous
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("semester_key"))
+            .transpose()?;
+        let previous_number = previous
+            .as_ref()
+            .map(|row| row.try_get::<i32, _>("academic_week"))
+            .transpose()?;
+        let change = classify_week_change(
+            previous_key
+                .as_deref()
+                .zip(previous_number.map(|number| number as u32)),
+            week,
+        );
+        match change {
+            WeekChange::InitialBaseline => {
+                sqlx::query(
+                    "INSERT INTO schedule_site_state \
+                     (singleton, semester_key, academic_week, file_name, file_url) \
+                     VALUES (TRUE, $1, $2, $3, $4) ON CONFLICT (singleton) DO NOTHING",
+                )
+                .bind(&week.term_key)
+                .bind(week.number as i32)
+                .bind(&week.file_name)
+                .bind(&week.file_url)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                return Ok(SiteReminderOutcome::BaselineStored);
+            }
+            WeekChange::NewSemesterBaseline => {
+                update_site_state(&mut tx, week).await?;
+                tx.commit().await?;
+                return Ok(SiteReminderOutcome::SemesterBaselineStored);
+            }
+            WeekChange::Unchanged => {
+                tx.commit().await?;
+                return Ok(SiteReminderOutcome::Unchanged);
+            }
+            WeekChange::Advanced => update_site_state(&mut tx, week).await?,
+        }
+
+        let schedule_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM schedule_weeks WHERE week_start = $1)",
+        )
+        .bind(target_week_start)
+        .fetch_one(&mut *tx)
+        .await?;
+        if schedule_exists {
+            tx.commit().await?;
+            return Ok(SiteReminderOutcome::ScheduleAlreadyPublished);
+        }
+
+        let already_reminded = sqlx::query(
+            "INSERT INTO schedule_reminder_weeks \
+             (week_start, academic_week, file_name, file_url) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (week_start) DO NOTHING",
+        )
+        .bind(target_week_start)
+        .bind(week.number as i32)
+        .bind(&week.file_name)
+        .bind(&week.file_url)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 0;
+        if already_reminded {
+            tx.commit().await?;
+            return Ok(SiteReminderOutcome::AlreadyReminded);
+        }
+
+        let message = format!(
+            "🔔 Напоминание о расписании\n\nНа сайте появился скан расписания на {week_number}-ю учебную неделю: {file_name}.\nВ боте пока нет Excel-расписания на {start}–{end}. Загрузите Excel-файл и подтвердите публикацию.\n\nСтраница расписания: {site_url}",
+            week_number = week.number,
+            file_name = week.file_name,
+            start = target_week_start.format("%d.%m.%Y"),
+            end = target_week_start
+                .checked_add_signed(chrono::Duration::days(6))
+                .context("не удалось вычислить конец целевой недели")?
+                .format("%d.%m.%Y"),
+            site_url = "https://itf.donstu.ru/raspisanie/Index/",
+        );
+        sqlx::query(
+            "INSERT INTO notification_outbox (telegram_id, body) \
+             SELECT telegram_id, $1 FROM users WHERE role = 'admin'",
+        )
+        .bind(message)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(SiteReminderOutcome::ReminderQueued)
     }
 
     pub async fn connect(database_url: &str) -> Result<Self> {
@@ -741,6 +876,20 @@ impl Store {
         .await?;
         Ok(())
     }
+}
+
+async fn update_site_state(tx: &mut Transaction<'_, Postgres>, week: &WebsiteWeek) -> Result<()> {
+    sqlx::query(
+        "UPDATE schedule_site_state SET semester_key = $1, academic_week = $2, \
+         file_name = $3, file_url = $4, observed_at = now() WHERE singleton = TRUE",
+    )
+    .bind(&week.term_key)
+    .bind(week.number as i32)
+    .bind(&week.file_name)
+    .bind(&week.file_url)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 #[derive(sqlx::FromRow)]

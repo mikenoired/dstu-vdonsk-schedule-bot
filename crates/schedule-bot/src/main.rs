@@ -2,8 +2,14 @@ use anyhow::{Context, Result, bail};
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use chrono::{NaiveDate, NaiveTime, Utc};
 use schedule_bot::{
-    AppState, archive::SourceArchive, format::DailyKind, handlers, metrics,
-    rate_limit::RateLimiter, stats::StatsStore, store::Store,
+    AppState,
+    archive::SourceArchive,
+    format::DailyKind,
+    handlers, metrics,
+    rate_limit::RateLimiter,
+    stats::StatsStore,
+    store::Store,
+    website_schedule::{ScheduleSiteClient, scheduled_check_slot, target_week_start},
 };
 use std::{env, time::Duration};
 use teloxide::{
@@ -107,6 +113,8 @@ async fn main() -> Result<()> {
         state.stats.clone(),
     ));
     tokio::spawn(daily_schedule_worker(state.clone()));
+    let schedule_site = ScheduleSiteClient::new()?;
+    tokio::spawn(weekly_site_reminder_worker(state.clone(), schedule_site));
 
     Dispatcher::builder(bot, handlers::schema())
         .dependencies(dptree::deps![state])
@@ -173,6 +181,49 @@ async fn daily_schedule_worker(state: AppState) {
             Err(error) => {
                 error!(%error, %delivery_date, "не удалось поставить ежедневные расписания в очередь")
             }
+        }
+    }
+}
+
+async fn weekly_site_reminder_worker(state: AppState, site: ScheduleSiteClient) {
+    let mut tick = tokio::time::interval(Duration::from_secs(15));
+    loop {
+        tick.tick().await;
+        let now = Utc::now().with_timezone(&state.timezone);
+        let Some(slot_start) = scheduled_check_slot(now) else {
+            continue;
+        };
+        let target_week = target_week_start(now);
+        match state.store.claim_schedule_site_check(slot_start).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                error!(%error, %slot_start, "не удалось зарезервировать проверку сайта расписания");
+                continue;
+            }
+        }
+
+        match site.fetch_latest_week().await {
+            Ok(week) => match state.store.observe_site_week(&week, target_week).await {
+                Ok(outcome) => info!(
+                    %slot_start,
+                    %target_week,
+                    site_week = week.number,
+                    semester = %week.term_key,
+                    ?outcome,
+                    "проверено расписание на сайте вуза"
+                ),
+                Err(error) => error!(
+                    %error,
+                    %target_week,
+                    "не удалось обработать новое расписание на сайте вуза"
+                ),
+            },
+            Err(error) => warn!(
+                %error,
+                %target_week,
+                "сайт расписания недоступен или его структура изменилась; повторим проверку через три часа"
+            ),
         }
     }
 }

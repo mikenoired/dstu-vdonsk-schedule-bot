@@ -1,5 +1,10 @@
-use chrono::NaiveDate;
-use schedule_bot::{domain::UpdateKind, format::DailyKind, store::Store};
+use chrono::{NaiveDate, TimeZone, Utc};
+use schedule_bot::{
+    domain::UpdateKind,
+    format::DailyKind,
+    store::{SiteReminderOutcome, Store},
+    website_schedule::WebsiteWeek,
+};
 use schedule_parser::Lesson;
 use sqlx::PgPool;
 
@@ -144,6 +149,83 @@ async fn registration_admin_group_publish_correction_and_outbox(
         daily_notice[0]
             .body
             .contains("📭 По опубликованному расписанию занятий нет.")
+    );
+    Ok(())
+}
+
+#[sqlx::test]
+async fn website_week_reminder_uses_baseline_and_notifies_each_admin_once(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let store = Store::from_pool(pool.clone());
+    store.register_user(901, 901, Some("admin-one")).await?;
+    assert!(store.claim_bootstrap_admin(901).await?);
+    store.register_user(902, 902, Some("admin-two")).await?;
+    let invite = store.create_invite(901).await?;
+    assert!(store.redeem_invite(902, &invite).await?);
+
+    let target_week = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+    let week4 = WebsiteWeek {
+        number: 4,
+        term_key: "осеннего семестра офо и озфо".into(),
+        file_name: "Расписание 4 учебной недели осеннего семестра ОФО и ОЗФО.pdf".into(),
+        file_url: "https://example.test/week4.pdf".into(),
+    };
+    assert_eq!(
+        store.observe_site_week(&week4, target_week).await?,
+        SiteReminderOutcome::BaselineStored
+    );
+    assert_eq!(store.queued_notifications().await?, 0);
+
+    let week5 = WebsiteWeek {
+        number: 5,
+        file_name: "Расписание 5 учебной недели осеннего семестра ОФО и ОЗФО.pdf".into(),
+        file_url: "https://example.test/week5.pdf".into(),
+        ..week4.clone()
+    };
+    assert_eq!(
+        store.observe_site_week(&week5, target_week).await?,
+        SiteReminderOutcome::ReminderQueued
+    );
+    let notices = store.ready_notifications(10).await?;
+    assert_eq!(notices.len(), 2);
+    assert!(notices.iter().all(|notice| {
+        notice.body.contains("5-ю учебную неделю") && notice.body.contains("28.09.2026–04.10.2026")
+    }));
+
+    assert_eq!(
+        store.observe_site_week(&week5, target_week).await?,
+        SiteReminderOutcome::Unchanged
+    );
+    let outbox_count: i64 = sqlx::query_scalar("SELECT count(*) FROM notification_outbox")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(outbox_count, 2);
+
+    let slot = Utc.with_ymd_and_hms(2026, 9, 25, 15, 0, 0).unwrap();
+    assert!(store.claim_schedule_site_check(slot).await?);
+    assert!(!store.claim_schedule_site_check(slot).await?);
+
+    let published = store
+        .preview_upload(
+            901,
+            "week-6.xls",
+            &"d".repeat(64),
+            vec![lesson_on((2026, 10, 5), "Алгебра", &["ИС11В"])],
+        )
+        .await?;
+    store.confirm_upload(published.id, 901).await?;
+    let week6 = WebsiteWeek {
+        number: 6,
+        file_name: "Расписание 6 учебной недели осеннего семестра ОФО и ОЗФО.pdf".into(),
+        file_url: "https://example.test/week6.pdf".into(),
+        ..week5
+    };
+    assert_eq!(
+        store
+            .observe_site_week(&week6, NaiveDate::from_ymd_opt(2026, 10, 5).unwrap())
+            .await?,
+        SiteReminderOutcome::ScheduleAlreadyPublished
     );
     Ok(())
 }
