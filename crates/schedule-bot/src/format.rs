@@ -55,13 +55,15 @@ fn format_schedule_inner(
         .iter()
         .filter(|lesson| !is_self_study(lesson))
         .collect();
-    let dates: Vec<_> = if let Some((start, end)) = date_range {
+    let mut dates: Vec<_> = if let Some((start, end)) = date_range {
         std::iter::successors(Some(start), |date| date.succ_opt())
             .take_while(|date| *date <= end)
             .collect()
     } else {
         visible.iter().map(|lesson| lesson.date).collect()
     };
+    dates.sort_unstable();
+    dates.dedup();
     let mut day_index = 0;
     for lesson in &visible {
         if show_dates {

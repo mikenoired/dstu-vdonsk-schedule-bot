@@ -1681,9 +1681,57 @@ fn suggest_groups(input: &str, groups: &[String]) -> Vec<String> {
 }
 
 fn suggest_teachers(input: &str, teachers: &[String]) -> Vec<String> {
-    suggest_matches(input, teachers, |teacher| {
-        format!("teacher:pick:{}", teacher_callback_id(teacher))
-    })
+    let normalized_input = normalize_group(input);
+    if normalized_input.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranked = teachers
+        .iter()
+        .filter_map(|teacher| {
+            if format!("teacher:pick:{}", teacher_callback_id(teacher)).len() > 64 {
+                return None;
+            }
+            teacher_match_score(&normalized_input, teacher).map(|score| (score, teacher.clone()))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|(left_score, left), (right_score, right)| {
+        left_score.cmp(right_score).then_with(|| left.cmp(right))
+    });
+    ranked.dedup_by(|left, right| left.1 == right.1);
+    ranked
+        .into_iter()
+        .take(7)
+        .map(|(_, teacher)| teacher)
+        .collect()
+}
+
+fn teacher_match_score(input: &str, teacher: &str) -> Option<(u8, usize)> {
+    let normalized_teacher = normalize_group(teacher);
+    if normalized_teacher == input {
+        return Some((0, 0));
+    }
+
+    let input_length = input.chars().count();
+    if input_length >= 3 && normalized_teacher.contains(input) {
+        return Some((1, normalized_teacher.chars().count() - input_length));
+    }
+
+    let words = teacher
+        .split(|character: char| !character.is_alphanumeric())
+        .map(normalize_group)
+        .filter(|word| !word.is_empty());
+    for word in words {
+        if word.starts_with(input) {
+            return Some((2, word.chars().count() - input_length));
+        }
+        if input_length >= 4 && group_distance(input, &word) <= 1 {
+            return Some((3, group_distance(input, &word)));
+        }
+    }
+
+    let full_distance = group_distance(input, &normalized_teacher);
+    (full_distance <= 1).then_some((4, full_distance))
 }
 
 fn suggest_matches(
