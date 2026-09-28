@@ -1,5 +1,5 @@
 use crate::domain::{ScheduleDiff, UpdateKind, compare_schedules, validate_schedule};
-use crate::format::{DailyKind, format_daily_delivery};
+use crate::format::{DailyKind, format_daily_delivery, format_teacher_daily_delivery};
 use crate::website_schedule::{WebsiteWeek, WeekChange, classify_week_change};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -21,8 +21,11 @@ pub struct User {
     pub telegram_id: i64,
     pub chat_id: i64,
     pub role: String,
+    pub schedule_profile: Option<String>,
     pub group_code: Option<String>,
     pub pending_group: Option<String>,
+    pub teacher_name: Option<String>,
+    pub pending_teacher: Option<String>,
     pub flow_state: String,
     pub search_kind: Option<String>,
     pub daily_notifications_enabled: bool,
@@ -274,7 +277,7 @@ impl Store {
 
     pub async fn user(&self, telegram_id: i64) -> Result<Option<User>> {
         Ok(sqlx::query_as::<_, UserRow>(
-            "SELECT telegram_id, chat_id, role, group_code, pending_group, flow_state, search_kind, daily_notifications_enabled \
+            "SELECT telegram_id, chat_id, role, schedule_profile, group_code, pending_group, teacher_name, pending_teacher, flow_state, search_kind, daily_notifications_enabled \
              FROM users WHERE telegram_id = $1",
         )
         .bind(telegram_id)
@@ -301,6 +304,31 @@ impl Store {
         )
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    pub async fn known_teachers(&self) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT BTRIM(l.teacher) AS teacher_name FROM schedule_weeks w \
+             JOIN lessons l ON l.version_id = w.current_version \
+             WHERE NULLIF(BTRIM(l.teacher), '') IS NOT NULL ORDER BY teacher_name",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn set_schedule_profile(&self, telegram_id: i64, profile: &str) -> Result<()> {
+        if !matches!(profile, "student" | "teacher") {
+            bail!("неизвестный профиль расписания `{profile}`");
+        }
+        sqlx::query(
+            "UPDATE users SET schedule_profile = $2, flow_state = 'menu', search_kind = NULL, \
+             pending_group = NULL, pending_teacher = NULL, updated_at = now() WHERE telegram_id = $1",
+        )
+        .bind(telegram_id)
+        .bind(profile)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn chat_group(&self, chat_id: i64) -> Result<Option<String>> {
@@ -353,9 +381,13 @@ impl Store {
         delivery_date: NaiveDate,
         kind: DailyKind,
     ) -> Result<u64> {
-        let recipients: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT telegram_id, group_code FROM users WHERE group_code IS NOT NULL \
-             AND daily_notifications_enabled ORDER BY telegram_id",
+        let recipients: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT telegram_id, schedule_profile, \
+                    CASE WHEN schedule_profile = 'teacher' THEN teacher_name ELSE group_code END \
+             FROM users WHERE daily_notifications_enabled AND \
+               ((schedule_profile = 'student' AND group_code IS NOT NULL) OR \
+                (schedule_profile = 'teacher' AND teacher_name IS NOT NULL)) \
+             ORDER BY telegram_id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -363,21 +395,23 @@ impl Store {
             return Ok(0);
         }
 
-        let groups = recipients
+        let identities = recipients
             .iter()
-            .map(|(_, group)| group.clone())
+            .map(|(_, profile, identity)| (profile.clone(), identity.clone()))
             .collect::<BTreeSet<_>>();
-        let mut lessons_by_group = std::collections::HashMap::new();
-        for group in groups {
-            lessons_by_group.insert(
-                group.clone(),
-                self.today_lessons(&group, delivery_date).await?,
-            );
+        let mut lessons_by_identity = std::collections::HashMap::new();
+        for (profile, identity) in identities {
+            let lessons = if profile == "teacher" {
+                self.today_teacher_lessons(&identity, delivery_date).await?
+            } else {
+                self.today_lessons(&identity, delivery_date).await?
+            };
+            lessons_by_identity.insert((profile, identity), lessons);
         }
 
         let mut tx = self.pool.begin().await?;
         let mut queued = 0;
-        for (telegram_id, group) in recipients {
+        for (telegram_id, profile, identity) in recipients {
             let inserted = sqlx::query_scalar::<_, i64>(
                 "INSERT INTO scheduled_deliveries (telegram_id, delivery_date, delivery_kind) \
                  VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING telegram_id",
@@ -392,11 +426,15 @@ impl Store {
                 continue;
             }
 
-            let lessons = lessons_by_group
-                .get(&group)
+            let lessons = lessons_by_identity
+                .get(&(profile.clone(), identity.clone()))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let body = format_daily_delivery(&group, delivery_date, kind, lessons);
+            let body = if profile == "teacher" {
+                format_teacher_daily_delivery(&identity, delivery_date, kind, lessons)
+            } else {
+                format_daily_delivery(&identity, delivery_date, kind, lessons)
+            };
             sqlx::query("INSERT INTO notification_outbox (telegram_id, body) VALUES ($1, $2)")
                 .bind(telegram_id)
                 .bind(body)
@@ -414,7 +452,7 @@ impl Store {
         state: &str,
         search_kind: Option<&str>,
     ) -> Result<()> {
-        sqlx::query("UPDATE users SET flow_state = $2, search_kind = $3, pending_group = NULL, updated_at = now() WHERE telegram_id = $1")
+        sqlx::query("UPDATE users SET flow_state = $2, search_kind = $3, pending_group = NULL, pending_teacher = NULL, updated_at = now() WHERE telegram_id = $1")
             .bind(telegram_id)
             .bind(state)
             .bind(search_kind)
@@ -424,7 +462,7 @@ impl Store {
     }
 
     pub async fn set_pending_group(&self, telegram_id: i64, group: &str) -> Result<()> {
-        sqlx::query("UPDATE users SET pending_group = $2, flow_state = 'confirm_group', updated_at = now() WHERE telegram_id = $1")
+        sqlx::query("UPDATE users SET pending_group = $2, pending_teacher = NULL, flow_state = 'confirm_group', updated_at = now() WHERE telegram_id = $1")
             .bind(telegram_id)
             .bind(group)
             .execute(&self.pool)
@@ -432,9 +470,36 @@ impl Store {
         Ok(())
     }
 
+    pub async fn set_pending_teacher(&self, telegram_id: i64, teacher: &str) -> Result<()> {
+        sqlx::query("UPDATE users SET pending_teacher = $2, pending_group = NULL, flow_state = 'confirm_teacher', updated_at = now() WHERE telegram_id = $1")
+            .bind(telegram_id)
+            .bind(teacher)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn confirm_teacher(&self, telegram_id: i64) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "UPDATE users SET teacher_name = pending_teacher, pending_teacher = NULL, pending_group = NULL, flow_state = 'menu', \
+             updated_at = now() WHERE telegram_id = $1 AND pending_teacher IS NOT NULL RETURNING teacher_name",
+        )
+        .bind(telegram_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn reject_pending_teacher(&self, telegram_id: i64) -> Result<()> {
+        sqlx::query("UPDATE users SET pending_teacher = NULL, flow_state = 'await_teacher', updated_at = now() WHERE telegram_id = $1")
+            .bind(telegram_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn confirm_group(&self, telegram_id: i64) -> Result<Option<String>> {
         let group: Option<String> = sqlx::query_scalar(
-            "UPDATE users SET group_code = pending_group, pending_group = NULL, flow_state = 'menu', \
+            "UPDATE users SET group_code = pending_group, pending_group = NULL, pending_teacher = NULL, flow_state = 'menu', \
              updated_at = now() WHERE telegram_id = $1 AND pending_group IS NOT NULL RETURNING group_code",
         )
         .bind(telegram_id)
@@ -526,6 +591,25 @@ impl Store {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    pub async fn today_teacher_lessons(
+        &self,
+        teacher: &str,
+        date: NaiveDate,
+    ) -> Result<Vec<Lesson>> {
+        let rows = sqlx::query_as::<_, DbLesson>(
+            "SELECT l.groups, l.lesson_date, l.weekday, l.lesson_number, l.start_time, l.end_time, \
+             l.subject, l.lesson_type, l.teacher, l.room, l.description \
+             FROM lessons l JOIN schedule_weeks w ON w.current_version = l.version_id \
+             WHERE LOWER(BTRIM(l.teacher)) = LOWER($1) AND l.lesson_date = $2 \
+             ORDER BY l.start_time, l.lesson_number, l.groups",
+        )
+        .bind(teacher)
+        .bind(date)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     pub async fn week_lessons(&self, group: &str, date: NaiveDate) -> Result<Vec<Lesson>> {
         let version: Option<Uuid> = sqlx::query_scalar(
             "SELECT w.current_version FROM schedule_weeks w \
@@ -570,6 +654,26 @@ impl Store {
              ORDER BY l.lesson_date, l.start_time, l.lesson_number",
         )
         .bind(group)
+        .bind(week_start)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn teacher_week_lessons_for_start(
+        &self,
+        teacher: &str,
+        week_start: NaiveDate,
+    ) -> Result<Vec<Lesson>> {
+        let rows = sqlx::query_as::<_, DbLesson>(
+            "SELECT l.groups, l.lesson_date, l.weekday, l.lesson_number, l.start_time, l.end_time, \
+             l.subject, l.lesson_type, l.teacher, l.room, l.description \
+             FROM lessons l JOIN schedule_weeks w ON w.current_version = l.version_id \
+             WHERE w.week_start = $2 AND LOWER(BTRIM(l.teacher)) = LOWER($1) \
+               AND l.lesson_date >= $2 AND l.lesson_date < $2 + 7 \
+             ORDER BY l.lesson_date, l.start_time, l.lesson_number, l.groups",
+        )
+        .bind(teacher)
         .bind(week_start)
         .fetch_all(&self.pool)
         .await?;
@@ -815,10 +919,27 @@ impl Store {
         } else {
             diff.0.changed_groups.clone()
         };
+        let notify_teachers = if kind == UpdateKind::NewWeek {
+            parsed_lessons
+                .0
+                .iter()
+                .filter_map(|lesson| lesson.teacher.as_deref())
+                .map(str::trim)
+                .filter(|teacher| !teacher.is_empty())
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            diff.0.changed_teachers.clone()
+        };
         let recipients = sqlx::query_scalar::<_, i64>(
-            "SELECT telegram_id FROM users WHERE group_code = ANY($1) AND daily_notifications_enabled",
+            "SELECT telegram_id FROM users WHERE daily_notifications_enabled AND \
+             ((schedule_profile = 'student' AND group_code = ANY($1)) OR \
+              (schedule_profile = 'teacher' AND teacher_name = ANY($2)))",
         )
         .bind(&notify_groups)
+        .bind(&notify_teachers)
         .fetch_all(&mut *tx)
         .await?;
         let body = notification_text(kind, week_start, week_end, &diff.0);
@@ -897,8 +1018,11 @@ struct UserRow {
     telegram_id: i64,
     chat_id: i64,
     role: String,
+    schedule_profile: Option<String>,
     group_code: Option<String>,
     pending_group: Option<String>,
+    teacher_name: Option<String>,
+    pending_teacher: Option<String>,
     flow_state: String,
     search_kind: Option<String>,
     daily_notifications_enabled: bool,
@@ -910,8 +1034,11 @@ impl From<UserRow> for User {
             telegram_id: row.telegram_id,
             chat_id: row.chat_id,
             role: row.role,
+            schedule_profile: row.schedule_profile,
             group_code: row.group_code,
             pending_group: row.pending_group,
+            teacher_name: row.teacher_name,
+            pending_teacher: row.pending_teacher,
             flow_state: row.flow_state,
             search_kind: row.search_kind,
             daily_notifications_enabled: row.daily_notifications_enabled,

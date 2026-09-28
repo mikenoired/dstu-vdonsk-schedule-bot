@@ -17,7 +17,11 @@ impl DailyKind {
 }
 
 pub fn format_schedule(title: &str, lessons: &[Lesson], show_dates: bool) -> String {
-    format_schedule_inner(title, lessons, show_dates, None)
+    format_schedule_inner(title, lessons, show_dates, None, true)
+}
+
+pub fn format_teacher_schedule(title: &str, lessons: &[Lesson], show_dates: bool) -> String {
+    format_schedule_inner(title, lessons, show_dates, None, false)
 }
 
 pub fn format_week_schedule(
@@ -26,7 +30,16 @@ pub fn format_week_schedule(
     week_start: NaiveDate,
     week_end: NaiveDate,
 ) -> String {
-    format_schedule_inner(title, lessons, true, Some((week_start, week_end)))
+    format_schedule_inner(title, lessons, true, Some((week_start, week_end)), true)
+}
+
+pub fn format_teacher_week_schedule(
+    title: &str,
+    lessons: &[Lesson],
+    week_start: NaiveDate,
+    week_end: NaiveDate,
+) -> String {
+    format_schedule_inner(title, lessons, true, Some((week_start, week_end)), false)
 }
 
 fn format_schedule_inner(
@@ -34,6 +47,7 @@ fn format_schedule_inner(
     lessons: &[Lesson],
     show_dates: bool,
     date_range: Option<(NaiveDate, NaiveDate)>,
+    show_teacher: bool,
 ) -> String {
     let mut lines = vec![title.to_owned(), "━━━━━━━━━━━━━━━━".to_owned()];
     let mut current_date: Option<NaiveDate> = None;
@@ -79,8 +93,10 @@ fn format_schedule_inner(
         if let Some(kind) = &lesson.lesson_type {
             details.push(format!("🧩 {kind}"));
         }
-        if let Some(teacher) = &lesson.teacher {
-            details.push(format!("👩‍🏫 {teacher}"));
+        if show_teacher {
+            if let Some(teacher) = &lesson.teacher {
+                details.push(format!("👩‍🏫 {teacher}"));
+            }
         }
         if let Some(room) = &lesson.room {
             details.push(format!("📍 {room}"));
@@ -125,6 +141,26 @@ pub fn format_daily_delivery(
     kind: DailyKind,
     lessons: &[Lesson],
 ) -> String {
+    format_daily_delivery_for_identity("Группа", group, date, kind, lessons, true)
+}
+
+pub fn format_teacher_daily_delivery(
+    teacher: &str,
+    date: NaiveDate,
+    kind: DailyKind,
+    lessons: &[Lesson],
+) -> String {
+    format_daily_delivery_for_identity("Преподаватель", teacher, date, kind, lessons, false)
+}
+
+fn format_daily_delivery_for_identity(
+    identity_label: &str,
+    identity: &str,
+    date: NaiveDate,
+    kind: DailyKind,
+    lessons: &[Lesson],
+    show_teacher: bool,
+) -> String {
     let heading = match kind {
         DailyKind::Today => format!(
             "☀️ Доброе утро! Расписание на сегодня · {} · {}",
@@ -137,11 +173,11 @@ pub fn format_daily_delivery(
             date.format("%d.%m.%Y")
         ),
     };
-    let title = format!("{heading}\n📚 Группа {group}");
+    let title = format!("{heading}\n📚 {identity_label} {identity}");
     if lessons.is_empty() {
         format!("{title}\n\n📭 По опубликованному расписанию занятий нет.")
     } else {
-        format_schedule(&title, lessons, false)
+        format_schedule_inner(&title, lessons, false, None, show_teacher)
     }
 }
 

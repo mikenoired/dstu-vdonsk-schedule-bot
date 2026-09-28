@@ -1,5 +1,7 @@
 use crate::AppState;
-use crate::format::{format_schedule, format_week_schedule};
+use crate::format::{
+    format_schedule, format_teacher_schedule, format_teacher_week_schedule, format_week_schedule,
+};
 use crate::stats::{self, Period};
 use anyhow::{Context, Result, anyhow};
 use chrono::{Datelike, NaiveDate};
@@ -126,10 +128,11 @@ async fn handle_private_message(
                 "выключены"
             };
             if text == "🔔 Уведомления" {
-                send_additional_menu(
+                send_additional_menu_for_profile(
                     &bot,
                     message.chat.id,
                     &format!("Ежедневные уведомления {status}."),
+                    user.schedule_profile.as_deref() == Some("teacher"),
                 )
                 .await?;
             } else {
@@ -165,7 +168,13 @@ async fn handle_private_message(
 
     if is_additional_button(text) {
         state.store.set_flow_state(user_id, "menu", None).await?;
-        send_additional_menu(&bot, message.chat.id, "Дополнительные настройки.").await?;
+        send_additional_menu_for_profile(
+            &bot,
+            message.chat.id,
+            "Дополнительные настройки.",
+            user.schedule_profile.as_deref() == Some("teacher"),
+        )
+        .await?;
         return Ok(());
     }
     if is_back_button(text) {
@@ -173,22 +182,57 @@ async fn handle_private_message(
         send_menu(&bot, message.chat.id, "Главное меню.").await?;
         return Ok(());
     }
-    if is_change_group_button(text) {
+    if is_change_identity_button(text) {
+        if user.schedule_profile.is_none() {
+            state
+                .store
+                .set_flow_state(user_id, "await_profile", None)
+                .await?;
+            send_profile_choice(&bot, message.chat.id, "Сначала выбери профиль расписания.")
+                .await?;
+        } else if user.schedule_profile.as_deref() == Some("teacher") {
+            state
+                .store
+                .set_flow_state(user_id, "await_teacher", None)
+                .await?;
+            send_text(&bot, message.chat.id, "Напиши своё имя, как в расписании.").await?;
+        } else {
+            state
+                .store
+                .set_flow_state(user_id, "await_group", None)
+                .await?;
+            send_text(&bot, message.chat.id, "Напиши свою учебную группу.").await?;
+        }
+        return Ok(());
+    }
+    if is_change_profile_button(text) {
         state
             .store
-            .set_flow_state(user_id, "await_group", None)
+            .set_flow_state(user_id, "await_profile", None)
             .await?;
-        send_text(&bot, message.chat.id, "Напиши свою учебную группу.").await?;
+        send_profile_choice(&bot, message.chat.id, "Выбери профиль расписания.").await?;
         return Ok(());
     }
 
     match user.flow_state.as_str() {
-        "await_group" => handle_group_input(&bot, message.chat.id, &state, user_id, text).await?,
+        "await_profile" => {
+            send_profile_choice(&bot, message.chat.id, "Выбери профиль кнопкой ниже.").await?
+        }
+        "await_group" => handle_group_input(&bot, message.chat.id, &state, text).await?,
         "confirm_group" => {
             send_group_confirmation(
                 &bot,
                 message.chat.id,
                 user.pending_group.as_deref().unwrap_or(""),
+            )
+            .await?
+        }
+        "await_teacher" => handle_teacher_input(&bot, message.chat.id, &state, text).await?,
+        "confirm_teacher" => {
+            send_teacher_confirmation(
+                &bot,
+                message.chat.id,
+                user.pending_teacher.as_deref().unwrap_or(""),
             )
             .await?
         }
@@ -212,7 +256,24 @@ async fn handle_private_message(
         }
         "await_search_text" => handle_search(&bot, message.chat.id, &state, user_id, text).await?,
         _ => {
-            if user.group_code.is_none() {
+            if user.schedule_profile.is_none() {
+                state
+                    .store
+                    .set_flow_state(user_id, "await_profile", None)
+                    .await?;
+                send_profile_choice(&bot, message.chat.id, "Сначала выбери профиль расписания.")
+                    .await?;
+            } else if user.schedule_profile.as_deref() == Some("teacher")
+                && user.teacher_name.is_none()
+            {
+                state
+                    .store
+                    .set_flow_state(user_id, "await_teacher", None)
+                    .await?;
+                send_text(&bot, message.chat.id, "Напиши своё имя, как в расписании.").await?;
+            } else if user.schedule_profile.as_deref() != Some("teacher")
+                && user.group_code.is_none()
+            {
                 state
                     .store
                     .set_flow_state(user_id, "await_group", None)
@@ -415,39 +476,98 @@ async fn handle_start(
         .user(user_id)
         .await?
         .ok_or_else(|| anyhow!("пользователь не найден"))?;
-    if user.role == "admin" {
-        if let Some(group) = user.group_code {
-            send_menu(
-                bot,
-                chat_id,
-                &format!("Ты вошёл как администратор. Группа: {group}.\nВыбери расписание в меню, отправь Excel для публикации или используй /admin_link."),
-            )
-            .await?;
-        } else {
-            state
-                .store
-                .set_flow_state(user_id, "await_group", None)
+    open_schedule_profile(bot, chat_id, &state.store, &user, true).await
+}
+
+async fn open_schedule_profile(
+    bot: &Bot,
+    chat_id: ChatId,
+    store: &crate::store::Store,
+    user: &crate::store::User,
+    greeting: bool,
+) -> Result<()> {
+    let admin_note = if user.role == "admin" {
+        " Права администратора сохранены: можно отправлять Excel и управлять ссылками."
+    } else {
+        ""
+    };
+    let greeting_text = if greeting { "Привет! " } else { "" };
+    match user.schedule_profile.as_deref() {
+        None => {
+            store
+                .set_flow_state(user.telegram_id, "await_profile", None)
                 .await?;
-            send_text(
+            send_profile_choice(
                 bot,
                 chat_id,
-                "Права администратора активны. Чтобы открыть расписание, напиши свою группу. Ты также можешь отправить Excel или создать ссылку командой /admin_link.",
+                &format!("{greeting_text}Кто будет пользоваться расписанием?{admin_note}"),
             )
             .await?;
         }
-    } else if let Some(group) = user.group_code {
-        send_menu(
-            bot,
-            chat_id,
-            &format!("С возвращением! Твоя группа: {group}."),
-        )
-        .await?;
-    } else {
-        state
-            .store
-            .set_flow_state(user_id, "await_group", None)
-            .await?;
-        send_text(bot, chat_id, "Привет! Напиши свою учебную группу.").await?;
+        Some("student") => {
+            if let Some(group) = user.group_code.as_deref() {
+                store.set_flow_state(user.telegram_id, "menu", None).await?;
+                send_menu(
+                    bot,
+                    chat_id,
+                    &format!(
+                        "{}Твоя группа: {group}.{admin_note}",
+                        if greeting {
+                            "С возвращением! "
+                        } else {
+                            ""
+                        }
+                    ),
+                )
+                .await?;
+            } else {
+                store
+                    .set_flow_state(user.telegram_id, "await_group", None)
+                    .await?;
+                send_text(
+                    bot,
+                    chat_id,
+                    &format!("{greeting_text}Напиши свою учебную группу.{admin_note}"),
+                )
+                .await?;
+            }
+        }
+        Some("teacher") => {
+            if let Some(teacher) = user.teacher_name.as_deref() {
+                store.set_flow_state(user.telegram_id, "menu", None).await?;
+                send_menu(
+                    bot,
+                    chat_id,
+                    &format!(
+                        "{}Преподаватель: {teacher}.{admin_note}",
+                        if greeting {
+                            "С возвращением! "
+                        } else {
+                            ""
+                        }
+                    ),
+                )
+                .await?;
+            } else {
+                store
+                    .set_flow_state(user.telegram_id, "await_teacher", None)
+                    .await?;
+                send_text(
+                    bot,
+                    chat_id,
+                    &format!(
+                        "{greeting_text}Напиши своё имя, как оно указано в расписании.{admin_note}"
+                    ),
+                )
+                .await?;
+            }
+        }
+        Some(_) => {
+            store
+                .set_flow_state(user.telegram_id, "await_profile", None)
+                .await?;
+            send_profile_choice(bot, chat_id, "Выбери профиль расписания.").await?;
+        }
     }
     Ok(())
 }
@@ -456,7 +576,6 @@ async fn handle_group_input(
     bot: &Bot,
     chat_id: ChatId,
     state: &AppState,
-    user_id: i64,
     input: &str,
 ) -> Result<()> {
     let groups = state.store.known_groups().await?;
@@ -465,6 +584,40 @@ async fn handle_group_input(
         send_group_suggestions(bot, chat_id, &suggestions).await?;
     } else {
         send_text(bot, chat_id, "Не нашёл похожих групп в опубликованных расписаниях. Проверь написание и попробуй ещё раз.").await?;
+    }
+    Ok(())
+}
+
+async fn handle_teacher_input(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &AppState,
+    input: &str,
+) -> Result<()> {
+    let teachers = state.store.known_teachers().await?;
+    let suggestions = suggest_teachers(input, &teachers);
+    if !suggestions.is_empty() {
+        let keyboard = InlineKeyboardMarkup::new(
+            suggestions
+                .iter()
+                .map(|teacher| {
+                    vec![InlineKeyboardButton::callback(
+                        teacher.clone(),
+                        format!("teacher:pick:{}", teacher_callback_id(teacher)),
+                    )]
+                })
+                .collect::<Vec<_>>(),
+        );
+        bot.send_message(chat_id, "Выбери своё имя в расписании:")
+            .reply_markup(keyboard)
+            .await?;
+    } else {
+        send_text(
+            bot,
+            chat_id,
+            "Не нашёл похожих преподавателей в опубликованных расписаниях. Проверь написание и попробуй ещё раз.",
+        )
+        .await?;
     }
     Ok(())
 }
@@ -528,12 +681,24 @@ async fn handle_callback(bot: Bot, query: CallbackQuery, state: AppState) -> Han
         .await?;
 
     match data.as_str() {
+        "profile:student" | "profile:teacher" => {
+            let profile = data.trim_start_matches("profile:");
+            state.store.set_schedule_profile(user_id, profile).await?;
+            let user = state
+                .store
+                .user(user_id)
+                .await?
+                .ok_or_else(|| anyhow!("пользователь не найден"))?;
+            open_schedule_profile(&bot, chat_id, &state.store, &user, false).await?;
+        }
         _ if data.starts_with("group:pick:") => {
             let selected = data.trim_start_matches("group:pick:");
             let user = state.store.user(user_id).await?;
             let known_groups = state.store.known_groups().await?;
-            if user.is_some_and(|user| user.flow_state == "await_group")
-                && known_groups.iter().any(|group| group == selected)
+            if user.is_some_and(|user| {
+                user.schedule_profile.as_deref() == Some("student")
+                    && user.flow_state == "await_group"
+            }) && known_groups.iter().any(|group| group == selected)
             {
                 state.store.set_pending_group(user_id, selected).await?;
                 send_group_confirmation(&bot, chat_id, selected).await?;
@@ -542,6 +707,32 @@ async fn handle_callback(bot: Bot, query: CallbackQuery, state: AppState) -> Han
                     &bot,
                     chat_id,
                     "Этот выбор группы уже устарел. Напиши группу ещё раз.",
+                )
+                .await?;
+            }
+        }
+        _ if data.starts_with("teacher:pick:") => {
+            let selected_hash = data.trim_start_matches("teacher:pick:");
+            let user = state.store.user(user_id).await?;
+            let known_teachers = state.store.known_teachers().await?;
+            let selected = known_teachers
+                .iter()
+                .find(|teacher| teacher_callback_id(teacher) == selected_hash);
+            if user.is_some_and(|user| {
+                user.schedule_profile.as_deref() == Some("teacher")
+                    && user.flow_state == "await_teacher"
+            }) {
+                if let Some(teacher) = selected {
+                    state.store.set_pending_teacher(user_id, teacher).await?;
+                    send_teacher_confirmation(&bot, chat_id, teacher).await?;
+                } else {
+                    send_text(&bot, chat_id, "Этот выбор уже устарел. Напиши имя ещё раз.").await?;
+                }
+            } else {
+                send_text(
+                    &bot,
+                    chat_id,
+                    "Этот выбор уже устарел. Сначала выбери профиль преподавателя.",
                 )
                 .await?;
             }
@@ -559,8 +750,38 @@ async fn handle_callback(bot: Bot, query: CallbackQuery, state: AppState) -> Han
             }
         }
         "group:no" => {
-            state.store.reject_pending_group(user_id).await?;
-            send_text(&bot, chat_id, "Хорошо, напиши правильную группу.").await?;
+            let user = state.store.user(user_id).await?;
+            if user.is_some_and(|user| {
+                user.schedule_profile.as_deref() == Some("student")
+                    && user.flow_state == "confirm_group"
+                    && user.pending_group.is_some()
+            }) {
+                state.store.reject_pending_group(user_id).await?;
+                send_text(&bot, chat_id, "Хорошо, напиши правильную группу.").await?;
+            }
+        }
+        "teacher:yes" => {
+            if let Some(teacher) = state.store.confirm_teacher(user_id).await? {
+                send_menu(&bot, chat_id, &format!("Преподаватель {teacher} сохранён.")).await?;
+            } else {
+                send_text(
+                    &bot,
+                    chat_id,
+                    "Не нашёл ожидающего подтверждения. Напиши имя ещё раз.",
+                )
+                .await?;
+            }
+        }
+        "teacher:no" => {
+            let user = state.store.user(user_id).await?;
+            if user.is_some_and(|user| {
+                user.schedule_profile.as_deref() == Some("teacher")
+                    && user.flow_state == "confirm_teacher"
+                    && user.pending_teacher.is_some()
+            }) {
+                state.store.reject_pending_teacher(user_id).await?;
+                send_text(&bot, chat_id, "Хорошо, напиши имя ещё раз.").await?;
+            }
         }
         "search:teacher" | "search:room" => {
             let kind = if data == "search:teacher" {
@@ -779,20 +1000,49 @@ async fn show_today(
     state: &AppState,
     user: &crate::store::User,
 ) -> Result<()> {
-    let Some(group) = user.group_code.as_deref() else {
-        state
-            .store
-            .set_flow_state(user.telegram_id, "await_group", None)
+    let teacher_profile = user.schedule_profile.as_deref() == Some("teacher");
+    let identity = if teacher_profile {
+        user.teacher_name.as_deref()
+    } else {
+        user.group_code.as_deref()
+    };
+    let Some(identity) = identity else {
+        if user.schedule_profile.is_none() {
+            state
+                .store
+                .set_flow_state(user.telegram_id, "await_profile", None)
+                .await?;
+            send_profile_choice(bot, chat_id, "Сначала выбери профиль расписания.").await?;
+        } else if teacher_profile {
+            state
+                .store
+                .set_flow_state(user.telegram_id, "await_teacher", None)
+                .await?;
+            send_text(bot, chat_id, "Напиши своё имя, как в расписании.").await?;
+        } else {
+            state
+                .store
+                .set_flow_state(user.telegram_id, "await_group", None)
+                .await?;
+            send_text(
+                bot,
+                chat_id,
+                "Напиши свою группу, чтобы я нашёл расписание.",
+            )
             .await?;
-        send_text(
-            bot,
-            chat_id,
-            "Напиши свою группу, чтобы я нашёл расписание.",
-        )
-        .await?;
+        }
         return Ok(());
     };
-    show_day(bot, chat_id, state, group, state.today(), None).await?;
+    show_day(
+        bot,
+        chat_id,
+        state,
+        identity,
+        teacher_profile,
+        state.today(),
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -802,21 +1052,50 @@ async fn show_week(
     state: &AppState,
     user: &crate::store::User,
 ) -> Result<()> {
-    let Some(group) = user.group_code.as_deref() else {
-        state
-            .store
-            .set_flow_state(user.telegram_id, "await_group", None)
+    let teacher_profile = user.schedule_profile.as_deref() == Some("teacher");
+    let identity = if teacher_profile {
+        user.teacher_name.as_deref()
+    } else {
+        user.group_code.as_deref()
+    };
+    let Some(identity) = identity else {
+        if user.schedule_profile.is_none() {
+            state
+                .store
+                .set_flow_state(user.telegram_id, "await_profile", None)
+                .await?;
+            send_profile_choice(bot, chat_id, "Сначала выбери профиль расписания.").await?;
+        } else if teacher_profile {
+            state
+                .store
+                .set_flow_state(user.telegram_id, "await_teacher", None)
+                .await?;
+            send_text(bot, chat_id, "Напиши своё имя, как в расписании.").await?;
+        } else {
+            state
+                .store
+                .set_flow_state(user.telegram_id, "await_group", None)
+                .await?;
+            send_text(
+                bot,
+                chat_id,
+                "Напиши свою группу, чтобы я нашёл расписание.",
+            )
             .await?;
-        send_text(
-            bot,
-            chat_id,
-            "Напиши свою группу, чтобы я нашёл расписание.",
-        )
-        .await?;
+        }
         return Ok(());
     };
     let week_start = current_week_start(state.today());
-    show_week_at(bot, chat_id, state, group, week_start, None).await?;
+    show_week_at(
+        bot,
+        chat_id,
+        state,
+        identity,
+        teacher_profile,
+        week_start,
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -824,16 +1103,33 @@ async fn show_day(
     bot: &Bot,
     chat_id: ChatId,
     state: &AppState,
-    group: &str,
+    identity: &str,
+    teacher_profile: bool,
     date: NaiveDate,
     message_id: Option<teloxide::types::MessageId>,
 ) -> Result<()> {
-    let lessons = state.store.today_lessons(group, date).await?;
-    let heading = format!("📅 {} · группа {group}", date.format("%d.%m.%Y"));
+    let lessons = if teacher_profile {
+        state.store.today_teacher_lessons(identity, date).await?
+    } else {
+        state.store.today_lessons(identity, date).await?
+    };
+    let identity_label = if teacher_profile {
+        "преподаватель"
+    } else {
+        "группа"
+    };
+    let heading = format!(
+        "📅 {} · {identity_label} {identity}",
+        date.format("%d.%m.%Y")
+    );
     let text = if lessons.is_empty() {
         format!("{heading}\n\n📭 По опубликованному расписанию занятий нет.")
     } else {
-        format_schedule(&heading, &lessons, false)
+        if teacher_profile {
+            format_teacher_schedule(&heading, &lessons, false)
+        } else {
+            format_schedule(&heading, &lessons, false)
+        }
     };
     let keyboard = day_navigation_keyboard(date);
     if let Some(message_id) = message_id {
@@ -852,24 +1148,41 @@ async fn show_week_at(
     bot: &Bot,
     chat_id: ChatId,
     state: &AppState,
-    group: &str,
+    identity: &str,
+    teacher_profile: bool,
     week_start: NaiveDate,
     message_id: Option<teloxide::types::MessageId>,
 ) -> Result<()> {
     let week_end = week_start + chrono::Duration::days(6);
-    let lessons = state
-        .store
-        .week_lessons_for_start(group, week_start)
-        .await?;
+    let lessons = if teacher_profile {
+        state
+            .store
+            .teacher_week_lessons_for_start(identity, week_start)
+            .await?
+    } else {
+        state
+            .store
+            .week_lessons_for_start(identity, week_start)
+            .await?
+    };
+    let identity_label = if teacher_profile {
+        "преподаватель"
+    } else {
+        "группа"
+    };
     let heading = format!(
-        "🗓️ Неделя {}–{} · группа {group}",
+        "🗓️ Неделя {}–{} · {identity_label} {identity}",
         week_start.format("%d.%m.%Y"),
         week_end.format("%d.%m.%Y")
     );
     let text = if lessons.is_empty() {
         format!("{heading}\n\n📭 Для этой недели расписание не опубликовано.")
     } else {
-        format_week_schedule(&heading, &lessons, week_start, week_end)
+        if teacher_profile {
+            format_teacher_week_schedule(&heading, &lessons, week_start, week_end)
+        } else {
+            format_week_schedule(&heading, &lessons, week_start, week_end)
+        }
     };
     let keyboard = week_navigation_keyboard(week_start);
     if let Some(message_id) = message_id {
@@ -907,7 +1220,13 @@ async fn handle_schedule_navigation(
         bot.answer_callback_query(query.id.clone()).await?;
         return Ok(());
     };
-    let Some(group) = user.group_code.as_deref() else {
+    let teacher_profile = user.schedule_profile.as_deref() == Some("teacher");
+    let identity = if teacher_profile {
+        user.teacher_name.as_deref()
+    } else {
+        user.group_code.as_deref()
+    };
+    let Some(identity) = identity else {
         bot.answer_callback_query(query.id.clone()).await?;
         return Ok(());
     };
@@ -918,7 +1237,16 @@ async fn handle_schedule_navigation(
             let Some(date) = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok() else {
                 return Ok(());
             };
-            show_day(bot, message.chat.id, state, group, date, Some(message.id)).await?;
+            show_day(
+                bot,
+                message.chat.id,
+                state,
+                identity,
+                teacher_profile,
+                date,
+                Some(message.id),
+            )
+            .await?;
         }
         [action, date] if data.starts_with("nav:week:") => {
             let Some(mut week_start) = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok() else {
@@ -946,7 +1274,8 @@ async fn handle_schedule_navigation(
                 bot,
                 message.chat.id,
                 state,
-                group,
+                identity,
+                teacher_profile,
                 week_start,
                 Some(message.id),
             )
@@ -1176,6 +1505,28 @@ async fn send_group_confirmation(bot: &Bot, chat_id: ChatId, group: &str) -> Res
     Ok(())
 }
 
+async fn send_teacher_confirmation(bot: &Bot, chat_id: ChatId, teacher: &str) -> Result<()> {
+    let keyboard = InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("✅ Да", "teacher:yes"),
+        InlineKeyboardButton::callback("❌ Нет", "teacher:no"),
+    ]]);
+    bot.send_message(chat_id, format!("Твоё расписание — {teacher}?"))
+        .reply_markup(keyboard)
+        .await?;
+    Ok(())
+}
+
+async fn send_profile_choice(bot: &Bot, chat_id: ChatId, text: &str) -> Result<()> {
+    let keyboard = InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("🎓 Студент", "profile:student"),
+        InlineKeyboardButton::callback("👩‍🏫 Преподаватель", "profile:teacher"),
+    ]]);
+    bot.send_message(chat_id, text)
+        .reply_markup(keyboard)
+        .await?;
+    Ok(())
+}
+
 async fn send_group_suggestions(bot: &Bot, chat_id: ChatId, groups: &[String]) -> Result<()> {
     let keyboard = InlineKeyboardMarkup::new(
         groups
@@ -1269,12 +1620,23 @@ async fn send_menu(bot: &Bot, chat_id: ChatId, text: &str) -> Result<()> {
     Ok(())
 }
 
-async fn send_additional_menu(bot: &Bot, chat_id: ChatId, text: &str) -> Result<()> {
+async fn send_additional_menu_for_profile(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    teacher_profile: bool,
+) -> Result<()> {
+    let identity_button = if teacher_profile {
+        "👩‍🏫 Сменить преподавателя"
+    } else {
+        "👥 Сменить группу"
+    };
     let keyboard = KeyboardMarkup::new(vec![
         vec![
             KeyboardButton::new("🔔 Уведомления"),
-            KeyboardButton::new("👥 Сменить группу"),
+            KeyboardButton::new(identity_button),
         ],
+        vec![KeyboardButton::new("🔄 Сменить профиль")],
         vec![KeyboardButton::new("⬅️ Назад")],
     ])
     .resize_keyboard();
@@ -1301,25 +1663,47 @@ fn is_additional_button(text: &str) -> bool {
 fn is_change_group_button(text: &str) -> bool {
     text == "Сменить группу" || text == "👥 Сменить группу"
 }
+fn is_change_teacher_button(text: &str) -> bool {
+    text == "Сменить преподавателя" || text == "👩‍🏫 Сменить преподавателя"
+}
+fn is_change_identity_button(text: &str) -> bool {
+    is_change_group_button(text) || is_change_teacher_button(text)
+}
+fn is_change_profile_button(text: &str) -> bool {
+    text == "Сменить профиль" || text == "🔄 Сменить профиль"
+}
 fn is_back_button(text: &str) -> bool {
     text == "Назад" || text == "⬅️ Назад"
 }
 
 fn suggest_groups(input: &str, groups: &[String]) -> Vec<String> {
+    suggest_matches(input, groups, |group| format!("group:pick:{group}"))
+}
+
+fn suggest_teachers(input: &str, teachers: &[String]) -> Vec<String> {
+    suggest_matches(input, teachers, |teacher| {
+        format!("teacher:pick:{}", teacher_callback_id(teacher))
+    })
+}
+
+fn suggest_matches(
+    input: &str,
+    candidates: &[String],
+    callback_data: impl Fn(&str) -> String,
+) -> Vec<String> {
     let normalized_input = normalize_group(input);
     if normalized_input.is_empty() {
         return Vec::new();
     }
 
-    let mut ranked = groups
+    let mut ranked = candidates
         .iter()
-        .filter_map(|group| {
-            let callback_data = format!("group:pick:{group}");
-            if callback_data.len() > 64 {
+        .filter_map(|candidate| {
+            if callback_data(candidate).len() > 64 {
                 return None;
             }
-            let distance = group_distance(&normalized_input, &normalize_group(group));
-            (distance <= 1).then(|| (distance, group.clone()))
+            let distance = group_distance(&normalized_input, &normalize_group(candidate));
+            (distance <= 1).then(|| (distance, candidate.clone()))
         })
         .collect::<Vec<_>>();
     ranked.sort_by(
@@ -1331,6 +1715,10 @@ fn suggest_groups(input: &str, groups: &[String]) -> Vec<String> {
     );
     ranked.dedup_by(|left, right| left.1 == right.1);
     ranked.into_iter().take(7).map(|(_, group)| group).collect()
+}
+
+fn teacher_callback_id(teacher: &str) -> String {
+    sha256_hex(teacher.as_bytes())[..16].to_owned()
 }
 
 fn normalize_group(group: &str) -> String {

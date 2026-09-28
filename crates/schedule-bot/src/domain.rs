@@ -23,6 +23,8 @@ impl UpdateKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScheduleDiff {
     pub changed_groups: Vec<String>,
+    #[serde(default)]
+    pub changed_teachers: Vec<String>,
     pub changed_dates: Vec<NaiveDate>,
     pub added: usize,
     pub removed: usize,
@@ -85,6 +87,7 @@ pub fn compare_schedules(old: &[Lesson], new: &[Lesson]) -> ScheduleDiff {
         .cloned()
         .collect();
     let mut changed_groups = BTreeSet::new();
+    let mut changed_teachers = BTreeSet::new();
     let mut changed_dates = BTreeSet::new();
     let mut added = 0;
     let mut removed = 0;
@@ -98,27 +101,41 @@ pub fn compare_schedules(old: &[Lesson], new: &[Lesson]) -> ScheduleDiff {
             .get(&(date, group.clone()))
             .cloned()
             .unwrap_or_default();
-        if same_entries(&old_entries, &new_entries) {
+        let old_keys = entry_keys(&old_entries);
+        let new_keys = entry_keys(&new_entries);
+        if old_keys == new_keys {
             continue;
         }
         changed_groups.insert(group);
         changed_dates.insert(date);
-        let old_keys = entry_keys(&old_entries);
-        let new_keys = entry_keys(&new_entries);
+        let changed_entry_keys = old_keys
+            .symmetric_difference(&new_keys)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for lesson in old_entries.iter().chain(new_entries.iter()) {
+            let key = serde_json::to_string(lesson).ok();
+            if key.is_some_and(|key| changed_entry_keys.contains(&key)) {
+                if let Some(teacher) = lesson
+                    .teacher
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|teacher| !teacher.is_empty())
+                {
+                    changed_teachers.insert(teacher.to_owned());
+                }
+            }
+        }
         added += new_keys.difference(&old_keys).count();
         removed += old_keys.difference(&new_keys).count();
     }
 
     ScheduleDiff {
         changed_groups: changed_groups.into_iter().collect(),
+        changed_teachers: changed_teachers.into_iter().collect(),
         changed_dates: changed_dates.into_iter().collect(),
         added,
         removed,
     }
-}
-
-fn same_entries(left: &[&Lesson], right: &[&Lesson]) -> bool {
-    entry_keys(left) == entry_keys(right)
 }
 
 fn entry_keys(lessons: &[&Lesson]) -> BTreeSet<String> {
