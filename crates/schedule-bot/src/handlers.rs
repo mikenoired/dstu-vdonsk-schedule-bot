@@ -1,5 +1,5 @@
 use crate::AppState;
-use crate::format::format_schedule;
+use crate::format::{format_schedule, format_week_schedule};
 use crate::stats::{self, Period};
 use anyhow::{Context, Result, anyhow};
 use chrono::{Datelike, NaiveDate};
@@ -798,7 +798,9 @@ async fn show_day(
             .reply_markup(keyboard)
             .await?;
     } else {
-        bot.send_message(chat_id, text).reply_markup(keyboard).await?;
+        bot.send_message(chat_id, text)
+            .reply_markup(keyboard)
+            .await?;
     }
     Ok(())
 }
@@ -824,7 +826,7 @@ async fn show_week_at(
     let text = if lessons.is_empty() {
         format!("{heading}\n\n📭 Для этой недели расписание не опубликовано.")
     } else {
-        format_schedule(&heading, &lessons, true)
+        format_week_schedule(&heading, &lessons, week_start, week_end)
     };
     let keyboard = week_navigation_keyboard(week_start);
     if let Some(message_id) = message_id {
@@ -832,7 +834,9 @@ async fn show_week_at(
             .reply_markup(keyboard)
             .await?;
     } else {
-        bot.send_message(chat_id, text).reply_markup(keyboard).await?;
+        bot.send_message(chat_id, text)
+            .reply_markup(keyboard)
+            .await?;
     }
     Ok(())
 }
@@ -935,14 +939,8 @@ fn day_navigation_keyboard(date: NaiveDate) -> InlineKeyboardMarkup {
 fn week_navigation_keyboard(week_start: NaiveDate) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback(
-                "⬅️ Предыдущая",
-                format!("nav:week:prev:{week_start}"),
-            ),
-            InlineKeyboardButton::callback(
-                "Следующая ➡️",
-                format!("nav:week:next:{week_start}"),
-            ),
+            InlineKeyboardButton::callback("⬅️ Предыдущая", format!("nav:week:prev:{week_start}")),
+            InlineKeyboardButton::callback("Следующая ➡️", format!("nav:week:next:{week_start}")),
         ],
         vec![
             InlineKeyboardButton::callback(

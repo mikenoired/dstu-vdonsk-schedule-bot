@@ -17,9 +17,45 @@ impl DailyKind {
 }
 
 pub fn format_schedule(title: &str, lessons: &[Lesson], show_dates: bool) -> String {
+    format_schedule_inner(title, lessons, show_dates, None)
+}
+
+pub fn format_week_schedule(
+    title: &str,
+    lessons: &[Lesson],
+    week_start: NaiveDate,
+    week_end: NaiveDate,
+) -> String {
+    format_schedule_inner(title, lessons, true, Some((week_start, week_end)))
+}
+
+fn format_schedule_inner(
+    title: &str,
+    lessons: &[Lesson],
+    show_dates: bool,
+    date_range: Option<(NaiveDate, NaiveDate)>,
+) -> String {
     let mut lines = vec![title.to_owned(), "━━━━━━━━━━━━━━━━".to_owned()];
     let mut current_date: Option<NaiveDate> = None;
-    for lesson in lessons {
+    let visible: Vec<_> = lessons
+        .iter()
+        .filter(|lesson| !is_self_study(lesson))
+        .collect();
+    let dates: Vec<_> = if let Some((start, end)) = date_range {
+        std::iter::successors(Some(start), |date| date.succ_opt())
+            .take_while(|date| *date <= end)
+            .collect()
+    } else {
+        visible.iter().map(|lesson| lesson.date).collect()
+    };
+    let mut day_index = 0;
+    for lesson in &visible {
+        if show_dates {
+            while dates.get(day_index).is_some_and(|date| *date < lesson.date) {
+                append_day_off(&mut lines, &dates[day_index]);
+                day_index += 1;
+            }
+        }
         if show_dates && current_date != Some(lesson.date) {
             lines.push(String::new());
             lines.push(format!(
@@ -28,6 +64,10 @@ pub fn format_schedule(title: &str, lessons: &[Lesson], show_dates: bool) -> Str
                 lesson.date.format("%d.%m.%Y")
             ));
             current_date = Some(lesson.date);
+            day_index = dates
+                .iter()
+                .position(|date| *date == lesson.date)
+                .map_or(day_index, |i| i + 1);
         }
         lines.push(format!(
             "🕒 {}–{} · пара №{}",
@@ -50,8 +90,33 @@ pub fn format_schedule(title: &str, lessons: &[Lesson], show_dates: bool) -> Str
         }
         lines.push(String::new());
     }
-    lines.push(format!("✨ Всего пар: {}", lessons.len()));
+    if show_dates {
+        while let Some(date) = dates.get(day_index) {
+            append_day_off(&mut lines, date);
+            day_index += 1;
+        }
+    }
+    if visible.is_empty() {
+        lines.push("📭 Пар нет".to_owned());
+    } else {
+        lines.push(format!("✨ Всего пар: {}", visible.len()));
+    }
     lines.join("\n")
+}
+
+fn append_day_off(lines: &mut Vec<String>, date: &NaiveDate) {
+    lines.push(String::new());
+    lines.push(format!(
+        "🗓️ {} · {}",
+        weekday_ru(date.weekday()),
+        date.format("%d.%m.%Y")
+    ));
+    lines.push("🌴 Выходной · пар нет".to_owned());
+}
+
+fn is_self_study(lesson: &Lesson) -> bool {
+    let text = format!("{} {}", lesson.subject, lesson.description).to_lowercase();
+    text.contains("самостоятель") && (text.contains("работ") || text.contains("занят"))
 }
 
 pub fn format_daily_delivery(
