@@ -481,7 +481,8 @@ impl Store {
 
     pub async fn confirm_teacher(&self, telegram_id: i64) -> Result<Option<String>> {
         Ok(sqlx::query_scalar(
-            "UPDATE users SET teacher_name = pending_teacher, pending_teacher = NULL, pending_group = NULL, flow_state = 'menu', \
+            "UPDATE users SET teacher_name = pending_teacher, pending_teacher = NULL, pending_group = NULL, \
+             schedule_profile = 'teacher', flow_state = 'menu', \
              updated_at = now() WHERE telegram_id = $1 AND pending_teacher IS NOT NULL RETURNING teacher_name",
         )
         .bind(telegram_id)
@@ -499,7 +500,8 @@ impl Store {
 
     pub async fn confirm_group(&self, telegram_id: i64) -> Result<Option<String>> {
         let group: Option<String> = sqlx::query_scalar(
-            "UPDATE users SET group_code = pending_group, pending_group = NULL, pending_teacher = NULL, flow_state = 'menu', \
+            "UPDATE users SET group_code = pending_group, pending_group = NULL, pending_teacher = NULL, \
+             schedule_profile = 'student', flow_state = 'menu', \
              updated_at = now() WHERE telegram_id = $1 AND pending_group IS NOT NULL RETURNING group_code",
         )
         .bind(telegram_id)
