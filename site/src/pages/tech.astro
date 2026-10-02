@@ -1,17 +1,18 @@
 ---
+import { getCollection, render } from 'astro:content';
 import SiteLayout from '../layouts/SiteLayout.astro';
+
+const benchmarks = await Promise.all((await getCollection('benchmarks')).map(async (entry) => ({ entry, Content: (await render(entry)).Content })));
 ---
-<SiteLayout title="Как устроено · Расписание ДГТУ" description="Технологии, проверяемые ограничения и методика бенчмарков бота расписания ДГТУ.">
+<SiteLayout title="Как устроено · Расписание ДГТУ" description="Технологии и замеры скорости разбора расписания ДГТУ.">
   <main class="wrap prose">
     <div class="label">Технически — по делу</div><h1>Как работает бот</h1>
     <p>Эта страница для тех, кому интересно, из чего собран сервис и что можно проверить. Основная задача простая: прочитать опубликованное расписание и доставить нужные пары человеку в Telegram.</p>
-    <div class="stack"><div class="stack-row"><b>Rust</b><span>Основной язык бота и парсера таблиц расписания.</span></div><div class="stack-row"><b>PostgreSQL</b><span>Пользовательские настройки, версии расписания и очередь уведомлений.</span></div><div class="stack-row"><b>Redis</b><span>Ограничение частоты запросов и временные счётчики внутреннего мониторинга.</span></div><div class="stack-row"><b>S3-хранилище</b><span>Оригиналы загруженных файлов расписания.</span></div><div class="stack-row"><b>Telegram</b><span>Бот получает запросы через long polling и отправляет ответы; справочный сайт работает как Mini App.</span></div><div class="stack-row"><b>Astro + MDX</b><span>Сайт и контентные страницы; журнал изменений редактируется в MDX и попадает на сайт при сборке.</span></div></div>
-    <h2>Измеримые ограничения</h2><p>Параметры текущей реализации — не обещания скорости или доступности.</p>
-    <div class="data"><div class="datum"><strong>15 МБ</strong><span>Максимальный размер файла расписания</span></div><div class="datum"><strong>6 / 10 с</strong><span>Лимит событий от одного пользователя</span></div><div class="datum"><strong>24 / 10 с</strong><span>Лимит команд для одного группового чата</span></div><div class="datum"><strong>2 / 9 дней</strong><span>Срок хранения минутных и часовых точек статистики</span></div></div>
-    <h2>Бенчмарки и стоимость</h2><p>В проекте пока нет воспроизводимых замеров времени ответа, нагрузки, потребления памяти или стоимости на пользователя. Поэтому здесь не публикуются проценты ускорения и суммы экономии без подтверждённых данных.</p>
-    <div class="notice">Один сервис выполняет разбор расписаний, выдачу пар и отправку уведомлений. Для работы нужны PostgreSQL, Redis и S3-совместимое хранилище. Фактическая стоимость зависит от выбранного хостинга, нагрузки и тарифов.</div>
-    <p>Чтобы сравнение было полезным, нужны одинаковые расписания и нагрузка, зафиксированные версии кода и инфраструктуры, а также опубликованный сценарий замера. Стоимость следует считать по реальным счетам за одинаковый период.</p>
-    <p>Служебный endpoint <code>/metrics</code> предназначен для мониторинга процесса и очереди. Это не счётчик студентов и не оценка сэкономленных денег. Состояние зависимостей проверяет <code>/healthz</code>.</p>
+    <div class="stack"><div class="stack-row"><b>Rust</b><span>Основной язык бота и парсера таблиц расписания.</span></div><div class="stack-row"><b>PostgreSQL</b><span>Пользовательские настройки, версии расписания и очередь уведомлений.</span></div><div class="stack-row"><b>Redis</b><span>Хранение временных данных для обработки запросов.</span></div><div class="stack-row"><b>S3-хранилище</b><span>Оригиналы загруженных файлов расписания.</span></div><div class="stack-row"><b>Telegram</b><span>Бот получает запросы через long polling и отправляет ответы; справочный сайт работает как Mini App.</span></div><div class="stack-row"><b>Astro + MDX</b><span>Сайт и контентные страницы; журнал изменений редактируется в MDX и попадает на сайт при сборке.</span></div></div>
+    <h2>Бенчмарк разбора расписаний</h2>
+    {benchmarks.map(({ entry, Content }) => <article class="benchmark"><h3>{entry.data.title}</h3><p class="benchmark-meta">{entry.data.date.toLocaleDateString('ru-RU')} · {entry.data.environment} · {entry.data.compiler}</p><Content /><p class="benchmark-meta">Прогрев: {entry.data.warmupRuns} прогонов · Измерение: {entry.data.measuredRuns} прогонов на каждом наборе.</p></article>)}
+    <div class="notice">Один Rust-сервис разбирает файлы расписания и обслуживает Telegram-бота. Для хранения расписаний и доставки уведомлений используются PostgreSQL, Redis и S3-совместимое хранилище.</div>
+    <p>Замеры охватывают локальное чтение и разбор книг Excel в оптимизированной сборке. Это время самой операции парсинга.</p>
     <a class="back" href="/">← Вернуться к возможностям и помощи</a>
   </main>
 </SiteLayout>
