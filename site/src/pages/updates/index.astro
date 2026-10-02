@@ -1,0 +1,13 @@
+---
+import { getCollection } from 'astro:content';
+import SiteLayout from '../../layouts/SiteLayout.astro';
+
+const updates = (await getCollection('updates')).sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf());
+---
+<SiteLayout title="Обновления · Расписание ДГТУ">
+  <main class="wrap prose">
+    <div class="label">История изменений</div><h1>Обновления бота</h1>
+    <p>Новые функции и заметные изменения. Страницы журнала пишутся в MDX.</p>
+    {updates.map((entry) => <article class="update-item"><time datetime={entry.data.date.toISOString()}>{entry.data.date.toLocaleDateString('ru-RU')}</time><h2><a href={`/updates/${entry.id}/`}>{entry.data.title}</a></h2><p>{entry.data.summary}</p></article>)}
+  </main>
+</SiteLayout>

@@ -27,6 +27,7 @@ sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "migrate", "macros"] }
 subtle = "2"
 teloxide = { version = "0.17", features = ["macros", "ctrlc_handler"] }
+tower-http = { version = "0.6", features = ["fs"] }
 thiserror.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "net"] }
 tracing = "0.1"

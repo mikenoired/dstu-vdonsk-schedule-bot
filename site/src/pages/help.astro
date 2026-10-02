@@ -1,0 +1,14 @@
+---
+import { getCollection, render } from 'astro:content';
+import SiteLayout from '../layouts/SiteLayout.astro';
+
+const entries = (await getCollection('help')).sort((a, b) => a.data.order - b.data.order);
+const sections = await Promise.all(entries.map(async (entry) => ({ entry, Content: (await render(entry)).Content })));
+---
+<SiteLayout title="Помощь · Расписание ДГТУ">
+  <main class="wrap prose">
+    <div class="label">Помощь</div><h1>Если что-то не получается</h1>
+    {sections.map(({ entry, Content }) => <section><h2>{entry.data.title}</h2><Content /></section>)}
+    <a class="back" href="/">← На главную</a>
+  </main>
+</SiteLayout>

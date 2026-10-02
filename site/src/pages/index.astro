@@ -1,0 +1,25 @@
+---
+import { getCollection, render } from 'astro:content';
+import SiteLayout from '../layouts/SiteLayout.astro';
+
+const updates = (await getCollection('updates')).sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf()).slice(0, 3);
+const help = (await getCollection('help')).sort((a, b) => a.data.order - b.data.order);
+const helpItems = await Promise.all(help.map(async (entry) => ({ entry, Content: (await render(entry)).Content })));
+---
+<SiteLayout>
+  <main class="wrap">
+    <section class="hero">
+      <div><div class="eyebrow">Расписание в Telegram</div><h1>Пары на сегодня.<br />Без поисков по чатам.</h1><p>Бот показывает расписание вашей группы или преподавателя и сообщает, когда в нём что-то меняется.</p><div class="actions"><a class="btn" href="/bot">Открыть бота</a><a class="btn secondary" href="#how">Как начать</a></div></div>
+      <div class="schedule-card" aria-label="Пример расписания"><div class="card-head"><span>Понедельник · 28 сентября</span><span class="pill">обновлено</span></div><div class="lesson"><span class="time">09:00</span><span><strong>Математический анализ</strong><small>Лекция · ИС11В</small></span><span class="room">303/2</span></div><div class="lesson"><span class="time">10:45</span><span><strong>Программирование</strong><small>Практика · ИС11В</small></span><span class="room">ДОТ</span></div><div class="lesson"><span class="time">12:30</span><span><strong>Физика</strong><small>Лабораторная · ИС11В</small></span><span class="room">214</span></div></div>
+    </section>
+    <div class="strip"><span><b>Студентам</b> — расписание по группе</span><span><b>Преподавателям</b> — пары по имени</span><span><b>Изменения</b> — уведомление в личку</span></div>
+    <section class="section" id="how"><div class="section-head"><div><div class="label">Начало работы</div><h2>Три шага до расписания</h2></div><p class="section-intro">Настройка занимает пару сообщений в боте. Выбор можно поменять позже.</p></div><div class="flow"><article><strong>Откройте бота</strong><p>Найдите бота по ссылке и нажмите «Запустить».</p></article><article><strong>Выберите профиль</strong><p>Укажите, вы студент или преподаватель.</p></article><article><strong>Задайте группу или имя</strong><p>Бот покажет подходящие пары и сохранит ваш выбор.</p></article></div></section>
+    <section class="section"><div class="section-head"><div><div class="label">Что можно делать</div><h2>Расписание под рукой</h2></div></div><div class="features"><article class="feature"><span class="icon">↗</span><h3>Проверять пары</h3><p>На сегодня, выбранный день или всю неделю.</p></article><article class="feature"><span class="icon">◷</span><h3>Получать напоминания</h3><p>Расписание на завтра вечером и на сегодня утром.</p></article><article class="feature"><span class="icon">⌁</span><h3>Следить за изменениями</h3><p>При публикации или исправлении бот сообщает о затронутых парах.</p></article></div></section>
+    <section class="section" id="help"><div class="support"><div class="label">Помощь</div><h2>Если что-то не получается</h2><p class="section-intro">Выберите ситуацию и попробуйте эти шаги.</p><div class="issues">
+      {helpItems.map(({ entry, Content }) => <details><summary>{entry.data.title}</summary><Content /></details>)}
+    </div><p class="section-intro">Проблема осталась? <a href="/help/">Другие способы получить помощь</a>.</p></div></section>
+    <section class="section" id="updates"><div class="section-head"><div><div class="label">Что нового</div><h2>Обновления бота</h2></div><a class="back" href="/updates/">Все обновления →</a></div>
+      {updates.map((entry) => <article class="updates"><time datetime={entry.data.date.toISOString()}>{entry.data.date.toLocaleDateString('ru-RU')}</time><span><b>{entry.data.title}</b> — {entry.data.summary}</span></article>)}
+    </section>
+  </main>
+</SiteLayout>

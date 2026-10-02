@@ -1,5 +1,11 @@
 use anyhow::{Context, Result, bail};
-use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use axum::{
+    Router,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Redirect},
+    routing::get,
+};
 use chrono::{NaiveDate, NaiveTime, Utc};
 use schedule_bot::{
     AppState,
@@ -19,6 +25,7 @@ use teloxide::{
     prelude::Requester,
     types::{BotCommand, BotCommandScope},
 };
+use tower_http::services::ServeDir;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -321,9 +328,12 @@ fn spawn_http_endpoints(state: AppState) -> Result<()> {
         .context("PORT должен быть числом от 1 до 65535")?;
     tokio::spawn(async move {
         let app = Router::new()
+            .route("/bot", get(bot_redirect))
             .route("/healthz", get(health_endpoint))
             .route("/metrics", get(metrics_endpoint))
             .with_state(state);
+        let app =
+            app.fallback_service(ServeDir::new("site/dist").append_index_html_on_directories(true));
         let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
             Ok(listener) => listener,
             Err(error) => {
@@ -331,12 +341,19 @@ fn spawn_http_endpoints(state: AppState) -> Result<()> {
                 return;
             }
         };
-        info!(port, "HTTP endpoints доступны на /healthz и /metrics");
+        info!(
+            port,
+            "сайт и HTTP endpoints доступны; мониторинг: /healthz и /metrics"
+        );
         if let Err(error) = axum::serve(listener, app).await {
             error!(%error, "HTTP endpoint завершился с ошибкой");
         }
     });
     Ok(())
+}
+
+async fn bot_redirect(State(state): State<AppState>) -> Redirect {
+    Redirect::temporary(&format!("https://t.me/{}", state.bot_username))
 }
 
 async fn health_endpoint(State(state): State<AppState>) -> StatusCode {

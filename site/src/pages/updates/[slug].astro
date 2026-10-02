@@ -1,0 +1,18 @@
+---
+import { getCollection, render } from 'astro:content';
+import SiteLayout from '../../layouts/SiteLayout.astro';
+
+export async function getStaticPaths() {
+  return (await getCollection('updates')).map((entry) => ({ params: { slug: entry.id }, props: { entry } }));
+}
+
+const { entry } = Astro.props;
+const { Content } = await render(entry);
+---
+<SiteLayout title={`${entry.data.title} · Обновления ДГТУ`}>
+  <main class="wrap prose">
+    <div class="label">Обновления · <time datetime={entry.data.date.toISOString()}>{entry.data.date.toLocaleDateString('ru-RU')}</time></div>
+    <h1>{entry.data.title}</h1><p>{entry.data.summary}</p><Content />
+    <a class="back" href="/updates/">← Все обновления</a>
+  </main>
+</SiteLayout>
