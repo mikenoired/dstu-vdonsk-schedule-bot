@@ -390,25 +390,20 @@ async fn handle_group_message(
             } else {
                 state.today()
             };
-            let lessons = if command == "week" {
-                state.store.week_lessons(&group, date).await?
+            if command == "week" {
+                show_week_at(
+                    &bot,
+                    chat_id,
+                    &state,
+                    &group,
+                    false,
+                    current_week_start(date),
+                    None,
+                    true,
+                )
+                .await?;
             } else {
-                state.store.today_lessons(&group, date).await?
-            };
-            if lessons.is_empty() {
-                let label = if command == "week" {
-                    format!("На неделю для группы {group} расписания не нашёл.")
-                } else {
-                    format!("На {} для группы {group} пар не нашёл.", date.format("%d.%m.%Y"))
-                };
-                send_text(&bot, chat_id, &label).await?;
-            } else {
-                let title = match command.as_str() {
-                    "week" => format!("На неделю · группа {group}"),
-                    "today" => format!("Сегодня · группа {group}"),
-                    _ => format!("{} · группа {group}", date.format("%d.%m.%Y")),
-                };
-                send_schedule(&bot, chat_id, &title, &lessons, command != "today").await?;
+                show_day(&bot, chat_id, &state, &group, false, date, None).await?;
             }
         }
         "help" | "start" => send_text(&bot, chat_id, group_help_text()).await?,
@@ -1094,6 +1089,7 @@ async fn show_week(
         teacher_profile,
         week_start,
         None,
+        false,
     )
     .await?;
     Ok(())
@@ -1152,6 +1148,7 @@ async fn show_week_at(
     teacher_profile: bool,
     week_start: NaiveDate,
     message_id: Option<teloxide::types::MessageId>,
+    group_chat: bool,
 ) -> Result<()> {
     let week_end = week_start + chrono::Duration::days(6);
     let lessons = if teacher_profile {
@@ -1184,7 +1181,11 @@ async fn show_week_at(
             format_week_schedule(&heading, &lessons, week_start, week_end)
         }
     };
-    let keyboard = week_navigation_keyboard(week_start);
+    let keyboard = if group_chat {
+        group_week_navigation_keyboard(week_start)
+    } else {
+        week_navigation_keyboard(week_start)
+    };
     if let Some(message_id) = message_id {
         bot.edit_message_text(chat_id, message_id, text)
             .reply_markup(keyboard)
@@ -1208,27 +1209,50 @@ async fn handle_schedule_navigation(
         .message
         .as_ref()
         .and_then(|message| message.regular_message());
-    let Some(message) = message.filter(|message| {
-        message.chat.id.0 == user_id && matches!(&message.chat.kind, ChatKind::Private(_))
-    }) else {
+    let Some(message) = message else {
         bot.answer_callback_query(query.id.clone())
-            .text("Навигация доступна в личном чате с ботом.")
+            .text("Не удалось открыть расписание из этого сообщения.")
             .await?;
         return Ok(());
     };
-    let Some(user) = state.store.user(user_id).await? else {
-        bot.answer_callback_query(query.id.clone()).await?;
-        return Ok(());
-    };
-    let teacher_profile = user.schedule_profile.as_deref() == Some("teacher");
-    let identity = if teacher_profile {
-        user.teacher_name.as_deref()
-    } else {
-        user.group_code.as_deref()
-    };
-    let Some(identity) = identity else {
-        bot.answer_callback_query(query.id.clone()).await?;
-        return Ok(());
+    let (identity, teacher_profile, group_chat) = match &message.chat.kind {
+        ChatKind::Private(_) if message.chat.id.0 == user_id => {
+            let Some(user) = state.store.user(user_id).await? else {
+                bot.answer_callback_query(query.id.clone()).await?;
+                return Ok(());
+            };
+            let teacher_profile = user.schedule_profile.as_deref() == Some("teacher");
+            let identity = if teacher_profile {
+                user.teacher_name
+            } else {
+                user.group_code
+            };
+            let Some(identity) = identity else {
+                bot.answer_callback_query(query.id.clone()).await?;
+                return Ok(());
+            };
+            (identity, teacher_profile, false)
+        }
+        ChatKind::Public(chat)
+            if matches!(
+                chat.kind,
+                PublicChatKind::Group | PublicChatKind::Supergroup(_)
+            ) =>
+        {
+            let Some(group) = state.store.chat_group(message.chat.id.0).await? else {
+                bot.answer_callback_query(query.id.clone())
+                    .text("Для этого чата расписание не настроено.")
+                    .await?;
+                return Ok(());
+            };
+            (group, false, true)
+        }
+        _ => {
+            bot.answer_callback_query(query.id.clone())
+                .text("Навигация доступна в чате, где показано расписание.")
+                .await?;
+            return Ok(());
+        }
     };
     bot.answer_callback_query(query.id.clone()).await?;
     let payload = data.split(':').skip(2).collect::<Vec<_>>();
@@ -1241,7 +1265,7 @@ async fn handle_schedule_navigation(
                 bot,
                 message.chat.id,
                 state,
-                identity,
+                &identity,
                 teacher_profile,
                 date,
                 Some(message.id),
@@ -1262,7 +1286,7 @@ async fn handle_schedule_navigation(
                     }
                     week_start = current;
                 }
-                "exit" => {
+                "exit" if !group_chat => {
                     bot.edit_message_reply_markup(message.chat.id, message.id)
                         .await?;
                     send_menu(bot, message.chat.id, "Режим просмотра недель закрыт.").await?;
@@ -1274,10 +1298,11 @@ async fn handle_schedule_navigation(
                 bot,
                 message.chat.id,
                 state,
-                identity,
+                &identity,
                 teacher_profile,
                 week_start,
                 Some(message.id),
+                group_chat,
             )
             .await?;
         }
@@ -1322,6 +1347,19 @@ fn week_navigation_keyboard(week_start: NaiveDate) -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback("✖️ Выйти", format!("nav:week:exit:{week_start}")),
         ],
     ])
+}
+
+fn group_week_navigation_keyboard(week_start: NaiveDate) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback(
+            "⬅️ Предыдущая неделя",
+            format!("nav:week:prev:{week_start}"),
+        ),
+        InlineKeyboardButton::callback(
+            "Следующая неделя ➡️",
+            format!("nav:week:next:{week_start}"),
+        ),
+    ]])
 }
 
 async fn handle_admin_link(
