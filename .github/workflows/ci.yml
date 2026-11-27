@@ -43,4 +43,7 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
-      - run: cargo test --workspace
+      - name: Run workspace tests
+        run: cargo test --workspace
+        env:
+          REDIS_URL: redis://localhost:6379
