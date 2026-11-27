@@ -1,6 +1,7 @@
 use calamine::{Data, Reader, open_workbook_auto};
-use chrono::NaiveDate;
+use chrono::{Datelike, Duration, NaiveDate};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 use thiserror::Error;
 
@@ -27,6 +28,8 @@ pub enum ParseError {
     Workbook(#[from] calamine::Error),
     #[error("в файле не найдено листов с таблицами расписания")]
     NoScheduleSheets,
+    #[error("не удалось однозначно определить неделю расписания")]
+    AmbiguousWeek,
 }
 
 /// Reads a weekly timetable from an Excel workbook (`.xls`, `.xlsx`, or `.xlsb`).
@@ -35,6 +38,7 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Vec<Lesson>, ParseError> {
     let names = workbook.sheet_names().to_owned();
     let mut lessons = Vec::new();
     let mut found_schedule = false;
+    let mut week_dates = Vec::new();
 
     for name in names {
         let range = workbook.worksheet_range(&name)?;
@@ -75,6 +79,9 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Vec<Lesson>, ParseError> {
             {
                 day_name = day.clone();
                 date = row.get(1).and_then(|v| parse_date(v));
+                if let Some(date) = date {
+                    week_dates.push(date);
+                }
             } else if let Some(date_text) = row.get(1).filter(|v| !v.is_empty()) {
                 date = parse_date(date_text).or(date);
             }
@@ -156,6 +163,7 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Vec<Lesson>, ParseError> {
     if !found_schedule {
         return Err(ParseError::NoScheduleSheets);
     }
+    select_schedule_week(&mut lessons, &week_dates)?;
     lessons.sort_by(|a, b| {
         (a.date, &a.start_time, &a.groups, &a.subject).cmp(&(
             b.date,
@@ -165,6 +173,33 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Vec<Lesson>, ParseError> {
         ))
     });
     Ok(lessons)
+}
+
+fn week_start(date: NaiveDate) -> Option<NaiveDate> {
+    date.checked_sub_signed(Duration::days(date.weekday().num_days_from_monday() as i64))
+}
+
+fn select_schedule_week(lessons: &mut Vec<Lesson>, dates: &[NaiveDate]) -> Result<(), ParseError> {
+    let lesson_weeks: std::collections::BTreeSet<_> = lessons
+        .iter()
+        .filter_map(|lesson| week_start(lesson.date))
+        .collect();
+    if lesson_weeks.len() <= 1 {
+        return Ok(());
+    }
+
+    let mut counts = BTreeMap::new();
+    for start in dates.iter().filter_map(|date| week_start(*date)) {
+        *counts.entry(start).or_insert(0usize) += 1;
+    }
+    let Some((&selected, &count)) = counts.iter().max_by_key(|(_, count)| *count) else {
+        return Err(ParseError::AmbiguousWeek);
+    };
+    if count <= dates.len() / 2 || !lesson_weeks.contains(&selected) {
+        return Err(ParseError::AmbiguousWeek);
+    }
+    lessons.retain(|lesson| week_start(lesson.date) == Some(selected));
+    Ok(())
 }
 
 pub fn for_group<'a>(lessons: &'a [Lesson], group: &str) -> Vec<&'a Lesson> {
@@ -329,6 +364,46 @@ mod tests {
         assert_eq!(display_room_name("ДОТ"), "Удалённо");
         assert_eq!(display_room_name(" дот "), "Удалённо");
         assert_eq!(display_room_name("303/2"), "303/2");
+    }
+
+    fn dated_lesson(date: (i32, u32, u32)) -> Lesson {
+        Lesson {
+            groups: vec!["ИС11В".into()],
+            date: NaiveDate::from_ymd_opt(date.0, date.1, date.2).unwrap(),
+            weekday: String::new(),
+            lesson_number: 1,
+            start_time: "08:20".into(),
+            end_time: "09:55".into(),
+            subject: "Тест".into(),
+            lesson_type: None,
+            teacher: None,
+            room: None,
+            description: "Тест".into(),
+        }
+    }
+
+    #[test]
+    fn selects_the_week_supported_by_day_rows() {
+        let mut lessons = vec![
+            dated_lesson((2026, 11, 23)),
+            dated_lesson((2026, 11, 30)),
+            dated_lesson((2026, 12, 5)),
+        ];
+        let dates = [(2026, 11, 23), (2026, 11, 30), (2026, 12, 1), (2026, 12, 5)]
+            .map(|(y, m, d)| NaiveDate::from_ymd_opt(y, m, d).unwrap());
+        select_schedule_week(&mut lessons, &dates).unwrap();
+        assert_eq!(lessons.len(), 2);
+        assert!(lessons.iter().all(|lesson| lesson.date >= dates[1]));
+    }
+
+    #[test]
+    fn rejects_ambiguous_weeks() {
+        let mut lessons = vec![dated_lesson((2026, 11, 23)), dated_lesson((2026, 11, 30))];
+        let dates: Vec<_> = lessons.iter().map(|lesson| lesson.date).collect();
+        assert!(matches!(
+            select_schedule_week(&mut lessons, &dates),
+            Err(ParseError::AmbiguousWeek)
+        ));
     }
 
     #[test]
