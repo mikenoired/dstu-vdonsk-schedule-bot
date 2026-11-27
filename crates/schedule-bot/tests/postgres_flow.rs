@@ -1,4 +1,4 @@
-use chrono::{NaiveDate, TimeZone, Utc};
+use chrono::{NaiveDate, Utc};
 use schedule_bot::{
     domain::UpdateKind,
     format::DailyKind,
@@ -202,7 +202,7 @@ async fn website_week_reminder_uses_baseline_and_notifies_each_admin_once(
         .await?;
     assert_eq!(outbox_count, 2);
 
-    let slot = Utc.with_ymd_and_hms(2026, 9, 25, 15, 0, 0).unwrap();
+    let slot = Utc::now() - chrono::Duration::days(1);
     assert!(store.claim_schedule_site_check(slot).await?);
     assert!(!store.claim_schedule_site_check(slot).await?);
 
