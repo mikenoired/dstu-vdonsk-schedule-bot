@@ -185,3 +185,29 @@ fn parses_the_four_attached_consecutive_weekly_workbooks() {
         );
     }
 }
+
+#[test]
+fn parses_the_fourteenth_week_workbook() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tables/week-14.xls");
+    let lessons = parse_file(path).unwrap();
+    let start = NaiveDate::from_ymd_opt(2026, 11, 30).unwrap();
+    let end = NaiveDate::from_ymd_opt(2026, 12, 6).unwrap();
+    assert_eq!(lessons.len(), 243);
+    assert!(
+        lessons
+            .iter()
+            .all(|lesson| (start..=end).contains(&lesson.date))
+    );
+}
+
+#[test]
+fn ignores_lessons_from_other_weeks_in_workbook() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mixed-weeks.xls");
+    let lessons = parse_file(path).unwrap();
+    assert_eq!(lessons.len(), 2);
+    assert!(
+        lessons
+            .iter()
+            .all(|lesson| lesson.date >= NaiveDate::from_ymd_opt(2026, 11, 30).unwrap())
+    );
+}
